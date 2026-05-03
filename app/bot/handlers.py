@@ -571,7 +571,9 @@ async def _route_blocks(chat_id: str, msg_id: int, data: str,
 
 def _build_picker_caption(sess: dict) -> str:
     blocks_meta = sess["blocks_meta"]
-    free_total = sum(b["free"] for b in blocks_meta)
+    known_free = [b.get("free", -1) for b in blocks_meta if b.get("free", -1) >= 0]
+    free_line = (f"🟢 إجمالي مقاعد متاحة: <b>{sum(known_free)}</b>"
+                 if known_free else "🟡 التوفّر المباشر غير معروف لهذه الخريطة")
     primary = sess["primary"] or "—"
     backups_str = (" → ".join(sess["backups"])) if sess["backups"] else "—"
     mode_lbl = "🟢 الوضع الحالي: <b>اختيار الرئيسي ⭐</b>" \
@@ -581,7 +583,7 @@ def _build_picker_caption(sess: dict) -> str:
         f"🗺️ <b>اختر البلوكات</b>\n\n"
         f"⭐ الرئيسي: <code>{primary}</code>\n"
         f"🔁 الاحتياطية: <code>{backups_str}</code>\n"
-        f"🟢 إجمالي مقاعد متاحة: <b>{free_total}</b>\n\n"
+        f"{free_line}\n\n"
         f"{mode_lbl}\n\n"
         f"بعد الانتهاء اضغط <b>✅ تأكيد البلوكات</b>"
     )
@@ -701,6 +703,8 @@ async def _handle_webapp_selection(chat_id: str, payload: dict,
     backups_raw = payload.get("backups") or []
     backups = [str(b).strip() for b in backups_raw if str(b).strip()]
     seats = [s for s in (payload.get("seats") or []) if s]
+    if not primary and backups:
+        primary = backups.pop(0)
 
     if not primary and not seats:
         await notifier.send(chat_id,
