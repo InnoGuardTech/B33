@@ -467,7 +467,7 @@ async def admin_db(wbk_admin: Optional[str] = Cookie(default=None),
 
         # Action column (only tables we safely can delete from)
         action = ""
-        if key_col is not None and selected in ("accounts", "events", "bookings", "watch_keywords", "sniper_tasks", "settings"):
+        if key_col is not None and selected in ("accounts", "events", "bookings", "event_blocks", "drop_watchers", "bot_settings", "settings"):
             action = f"""
 <td style="white-space:nowrap">
   <form method="POST" action="/admin/db/delete" style="display:inline">

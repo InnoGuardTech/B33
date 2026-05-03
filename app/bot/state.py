@@ -3,7 +3,8 @@ Tiny in-memory FSM to track multi-step conversations:
   • waiting_email       — user tapped ➕ Add account, now must send email
   • waiting_password    — we have email, need password
   • waiting_qty_custom  — user tapped "custom" qty, now send a number
-  • waiting_keyword     — user is adding a watch keyword
+  • waiting_qty         — booking flow waiting for ticket count
+  • waiting_event_link  — user tapped 🔗 send event link
   • waiting_captcha     — captcha screenshot sent, awaiting user answer
 """
 from __future__ import annotations

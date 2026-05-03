@@ -26,10 +26,9 @@ from app.web.admin import router as admin_router, maybe_rebind_webhook
 from app.core.logging_setup import setup_logging
 from app.core.db import backend as db_backend, is_persistent as db_is_persistent
 from app.core.storage import (
-    add_keyword, list_accounts, list_bookings, list_keywords,
-    list_recent_events,
+    list_accounts, list_bookings, list_recent_events,
 )
-from app.services.event_monitor import fetch_loop, sniper_loop
+from app.services.event_monitor import fetch_loop
 from app.services.keep_alive import keep_alive_loop
 from app.services.seatsio_runtime import stop_all as stop_seat_warmers
 
@@ -42,17 +41,7 @@ background_tasks: list[asyncio.Task] = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 Webook Sniper Bot v3 starting…")
-
-    # Seed default watch keywords on the very first boot (non-blocking)
-    try:
-        if not list_keywords():
-            from app.core.config import DEFAULT_WATCH_KEYWORDS
-            for k in DEFAULT_WATCH_KEYWORDS:
-                add_keyword(k, "system")
-            log.info(f"seeded {len(DEFAULT_WATCH_KEYWORDS)} default keywords")
-    except Exception as e:
-        log.error(f"seed keywords failed: {e}")
+    log.info("🚀 Webook Bot v4 starting…")
 
     # Defer ALL network-dependent startup to a background task so the
     # FastAPI HTTP port opens immediately. This avoids "No open ports
@@ -70,8 +59,13 @@ async def lifespan(app: FastAPI):
                     log.info(f"✅ webhook set → {hook_url}")
                     background_tasks.append(asyncio.create_task(
                         fetch_loop(notifier), name="evt-fetch"))
-                    background_tasks.append(asyncio.create_task(
-                        sniper_loop(notifier), name="sniper-loop"))
+                    # Drop watcher loop (event-driven, replaces sniper_loop)
+                    try:
+                        from app.services.drop_watcher import drop_watcher_loop
+                        background_tasks.append(asyncio.create_task(
+                            drop_watcher_loop(notifier), name="drop-watcher"))
+                    except Exception as e:
+                        log.warning(f"drop watcher unavailable: {e}")
                     if KEEP_ALIVE_ENABLED:
                         background_tasks.append(asyncio.create_task(
                             keep_alive_loop(), name="keep-alive"))
@@ -84,8 +78,12 @@ async def lifespan(app: FastAPI):
             long_poll_loop(notifier), name="tg-poll"))
         background_tasks.append(asyncio.create_task(
             fetch_loop(notifier), name="evt-fetch"))
-        background_tasks.append(asyncio.create_task(
-            sniper_loop(notifier), name="sniper-loop"))
+        try:
+            from app.services.drop_watcher import drop_watcher_loop
+            background_tasks.append(asyncio.create_task(
+                drop_watcher_loop(notifier), name="drop-watcher"))
+        except Exception as e:
+            log.warning(f"drop watcher unavailable: {e}")
         if KEEP_ALIVE_ENABLED:
             background_tasks.append(asyncio.create_task(
                 keep_alive_loop(), name="keep-alive"))
@@ -117,9 +115,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Webook Sniper Bot",
-    version="3.2.0",
-    description="Interactive Telegram bot for automated ticket booking.",
+    title="Webook Bot",
+    version="4.0.0",
+    description="Interactive Telegram bot for automated ticket booking with Hydra Seat Engine.",
     lifespan=lifespan,
 )
 app.include_router(admin_router)
@@ -135,7 +133,7 @@ async def dashboard() -> HTMLResponse:
     ready = len([a for a in accs if a.get("status") == "ready"])
     return HTMLResponse(f"""
 <!doctype html><html lang="ar" dir="rtl">
-<head><meta charset="utf-8"><title>Webook Sniper Bot</title>
+<head><meta charset="utf-8"><title>Webook Bot v4</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 *{{box-sizing:border-box;font-family:-apple-system,'Segoe UI',Tahoma,sans-serif}}
@@ -162,8 +160,8 @@ a:hover{{text-decoration:underline}}
 </style></head><body><div class="wrap">
 
 <div class="card">
-  <h1>🎯 Webook Sniper Bot <span class="badge">v3.0 Online</span></h1>
-  <p class="muted">بوت حجز تذاكر تفاعلي عبر تيليجرام — محسّن للعمل 24/7 على Render Free</p>
+  <h1>🎯 Webook Bot <span class="badge">v4.0 Hydra</span></h1>
+  <p class="muted">بوت حجز تذاكر تفاعلي عبر تيليجرام — محرك Hydra لخرائط seats.io</p>
   <div class="grid">
     <div class="stat"><b>{len(accs)}</b>حسابات</div>
     <div class="stat"><b>{ready}</b>جاهزة</div>
@@ -175,7 +173,7 @@ a:hover{{text-decoration:underline}}
 
 <div class="card">
   <h3>💬 استخدم البوت مباشرةً عبر تيليجرام</h3>
-  <p>افتح البوت من تيليجرام وإضغط أي زر لفتح القائمة التفاعلية. كل شيء عبر الأزرار فقط — لا توجد أوامر نصية.</p>
+  <p>أرسل رابط فعالية → يجلب البوت بيانات seats.io فوراً → تختار البلوك الرئيسي والاحتياطي → يحجز ويلخّص النتيجة بذكاء.</p>
 </div>
 
 <div class="card">
@@ -206,7 +204,7 @@ async def health():
     accs = list_accounts()
     return {
         "status": "ok",
-        "version": "3.1.0",
+        "version": "4.0.0",
         "accounts_total": len(accs),
         "accounts_ready": sum(1 for a in accs if a.get("status") == "ready"),
         "events_cached": len(list_recent_events(limit=999)),
@@ -233,7 +231,6 @@ async def stats():
         },
         "events_cached": len(list_recent_events(limit=999)),
         "bookings_total": len(list_bookings(limit=9999)),
-        "watch_keywords": len(list_keywords()),
         "public_url": PUBLIC_URL,
     }
 

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: webook-sniper-bot
+    name: webook-bot
     env: docker
     plan: free
     region: frankfurt
@@ -9,12 +9,23 @@ services:
     autoDeploy: true
     pullRequestPreviewsEnabled: false
     envVars:
+      # ── Telegram (sealed secrets — set via Render dashboard) ────────
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: AUTHORIZED_CHAT_IDS
         sync: false
+
+      # ── Persistent database ────────────────────────────────────────
+      - key: DATABASE_URL
+        sync: false
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+
+      # ── Server defaults ───────────────────────────────────────────
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PORT
@@ -25,8 +36,6 @@ services:
         value: "600"
       - key: EVENT_POLL_INTERVAL
         value: "300"
-      - key: SNIPER_POLL_INTERVAL
-        value: "2"
       - key: HEADLESS
         value: "true"
       - key: LOG_LEVEL
@@ -34,14 +43,30 @@ services:
       - key: WEBOOK_LANG
         value: "ar"
 
-      # ---- Persistent PostgreSQL storage ----
-      # Primary storage on an external PostgreSQL instance.
-      # Set via Render dashboard → Environment → DATABASE_URL.
-      - key: DATABASE_URL
-        sync: false
+      # ── Hydra Seat Engine ─────────────────────────────────────────
+      - key: SEATSIO_ENABLED
+        value: "true"
+      - key: SEATSIO_PREWARM_ENABLED
+        value: "true"
+      - key: SEATSIO_DROP_WATCHER_ENABLED
+        value: "true"
+      - key: SEATSIO_DROP_WATCHER_MAX_WAIT
+        value: "1800"
+      - key: SEATSIO_STATUS_INTERVAL
+        value: "0.60"
 
-      # ---- Optional fallback: Turso cloud SQLite ----
-      - key: TURSO_DATABASE_URL
+      # ── Payment ───────────────────────────────────────────────────
+      - key: DEFAULT_PAYMENT_METHOD
+        value: "credit_card"
+
+      # ── Reliability (sealed) ──────────────────────────────────────
+      - key: CAPTCHA_API_KEY
         sync: false
-      - key: TURSO_AUTH_TOKEN
+      - key: PROXY_SERVER
+        sync: false
+      - key: PROXY_USERNAME
+        sync: false
+      - key: PROXY_PASSWORD
+        sync: false
+      - key: ADMIN_PASSWORD
         sync: false

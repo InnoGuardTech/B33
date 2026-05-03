@@ -1,107 +1,121 @@
-# 🎯 Webook Sniper Bot — v3.0
+# 🎯 Webook Bot v4.0 — Hydra Seat Engine
 
-بوت تيليجرام تفاعلي لحجز تذاكر الفعاليات على **webook.com** تلقائياً. يعمل على Render Free.
+بوت تيليجرام احترافي لحجز تذاكر [webook.com](https://webook.com) — مصمّم للعمل 24/7 على Render Free مع تكامل عميق مع خرائط seats.io.
+
+> ⚡ تحديث v4: نظام "قنّاص الثواني" و "كلمات المراقبة" حُذفا. وُلِد محرك **Hydra** للتعامل مع seats.io: اكتشاف تلقائي للبلوكات، حجز مقاعد متجاورة، تنقّل ذكي بين البلوكات الاحتياطية، توسّع هندسي تلقائي، ووضع ترقّب مدفوع بأحداث WebSocket.
 
 ---
 
-## ✨ المميزات
+## 🔬 المعمارية
 
-| المجال | الوصف |
+```
+B2/
+├── main.py                       FastAPI + Telegram dispatcher + lifespan
+├── Dockerfile                    Playwright base (chromium pre-installed)
+├── render.yaml                   نشر Docker على Render Free / Frankfurt
+├── requirements.txt
+└── app/
+    ├── core/
+    │   ├── config.py             ENV + DB-backed bot_settings (هجين)
+    │   ├── db.py                 PostgreSQL / SQLite abstraction
+    │   └── storage.py            CRUD: accounts, events, bookings,
+    │                              event_blocks, drop_watchers, seat_maps,
+    │                              bot_settings
+    ├── bot/
+    │   ├── handlers.py           dispatcher (link → blocks → qty → book)
+    │   ├── keyboards.py          inline keyboards + blocks_picker
+    │   └── …
+    ├── services/
+    │   ├── booking_http.py       محرك الحجز HTTP-direct
+    │   ├── booking_orchestrator  التوازي عبر الحسابات
+    │   ├── block_analyzer.py     ⭐ extract_blocks + adjacency +
+    │   │                          geometric_neighbors
+    │   ├── drop_watcher.py       ⭐ WS multiplexer event-driven sniper
+    │   ├── seat_summarizer.py    ⭐ تلخيص ذكي: "CAT 1 - S block 5 (117-121)"
+    │   ├── seatsio_client.py     SeatCloud REST + WS + hold tokens
+    │   ├── seatsio_runtime.py    prewarm cache (rendering_info + statuses)
+    │   ├── seatsio_token_fetcher  استخراج workspace_key من frontend bundle
+    │   └── …
+    └── web/admin.py              لوحة إدارة كاملة /admin
+```
+
+---
+
+## 🚀 سير العمل (User Flow)
+
+1. **الإدخال**: المستخدم يرسل رابط فعالية أو يختار من القائمة.
+2. **اكتشاف seats.io**: البوت يستخرج `event_key` ويجلب `rendering_info` ويُحضّرها في `seat_maps` cache (قابلة لإعادة الاستخدام).
+3. **اختيار البلوكات**: قائمة تفاعلية بكل البلوكات + عدد المتاح/الإجمالي. المستخدم يضغط ⭐ لتحديد الرئيسي ثم يضيف احتياطية بالترتيب (S1, S2, …).
+4. **خوارزمية الحجز**:
+   - Adjacency: مقاعد متجاورة لكل حساب على نفس الصف
+   - Auto-fallback: رئيسي → احتياطي 1 → احتياطي 2 → …
+   - Geometric expansion: عند استنفاد المختار، يحسب أقرب البلوكات بـ Euclidean distance ويُكمل
+   - Drop watching: عند امتلاء الخريطة، يدخل وضع ترقّب مدفوع بـ WebSocket
+5. **التلخيص**: تجميع المقاعد في صيغة `CAT 1 - S block 5 (117-121)` بدلاً من سرد كل مقعد.
+
+---
+
+## 🔧 Hydra Seat Engine — طبقات
+
+| الطبقة | الوظيفة |
 |---|---|
-| 🧭 **واجهة بالأزرار** | قائمة تفاعلية كاملة عبر InlineKeyboard — لا أوامر معقدة |
-| 🔐 **تسجيل دخول مرة واحدة** | Playwright يستخدم فقط عند login، ثم JWT Bearer يُحفظ ويُجدَّد تلقائياً |
-| 🧩 **حل reCAPTCHA بالتفاعل** | يرسل لك البوت صورة الـ captcha على تيليجرام، وترد بـ `ok` بعد حلّها |
-| 👥 **توزيع ذكي** | خوارزمية تقسّم عدد التذاكر على حسابات متعددة احتراماً لـ `max_per_order` |
-| 📡 **API-first** | جميع عمليات الحجز تتم عبر `api.webook.com` مباشرةً (aiohttp)، سرعة × 20 |
-| 🪑 **SeatCloud / seats.io** | دعم فعلي للأحداث المقعدية عبر holdToken + تحديد مقاعد متجاورة + fallback stalker mode |
-| 🔥 **قنّاص سباق الثواني** | حلقة سريعة + prewarming للمقاعد قبل الافتتاح |
-| 🔔 **مراقبة خلفية** | يجلب كل 5 دقائق الفعاليات الجديدة وينبّه على كلمات متابعة تختارها |
-| 💤 **Keep-Alive** | ping داخلي + endpoint `/health` يمنع نوم Render المجاني |
-| 🗃️ **SQLite مستمرة** | المهام والحجوزات والحسابات تبقى بعد إعادة التشغيل |
-| 🖥️ **لوحة ويب** | صفحة `/` فيها إحصائيات حيّة |
+| **A — Bundle Sentinel** | يتابع `index-*.js` ويستخرج `workspace_key` ديناميكياً |
+| **B — Seat Map Cache** | يحفظ `rendering_info` في PostgreSQL لإعادة الاستخدام عبر الجلسات |
+| **C — WS Multiplexer** | اتصال WebSocket واحد لكل `event_key` يُوزّع الأحداث على كل المراقبين (يخفض ذاكرة Render Free) |
+| **D — Predictive Drop Sniper** | عند `objectStatusChanged → free` يُنفّذ hold فوراً (~80ms) |
 
 ---
 
-## 🧭 تدفق الاستخدام
+## 📦 النشر على Render
 
-1. أرسل للبوت `/start` → قائمة رئيسية
-2. **إدارة الحسابات** → ➕ إضافة حساب → تعطي الإيميل → تعطي كلمة المرور
-3. اضغط **🔐 تسجيل الدخول** — إذا ظهر reCAPTCHA:
-   - البوت يرسل لك صورة
-   - تفتحها، تحل الـ captcha (نقرة على "أنا لست روبوتاً" ثم verify)
-   - ترسل رسالة نصية للبوت: `ok`
-   - البوت يكمل تلقائياً ويستخرج التوكن
-4. **الفعاليات الجارية** → اختر فعالية → اختر نوع التذكرة → اختر العدد → **تأكيد**
-5. البوت يحجز على جميع الحسابات بالتوازي ويُرجع روابط PayTabs جاهزة
-
----
-
-## 🏗️ البنية
-
-```
-app/
-├── core/
-│   ├── config.py           ← إعدادات من env
-│   ├── logging_setup.py    ← logger موحد
-│   └── storage.py          ← SQLite
-├── services/
-│   ├── webook_api.py       ← aiohttp client لـ api.webook.com
-│   ├── event_discovery.py  ← استكشاف فعاليات من الصفحة الرئيسية
-│   ├── auth_service.py     ← Playwright login + JWT refresh
-│   ├── captcha_broker.py   ← ربط Playwright بحوار Telegram
-│   ├── distributor.py      ← توزيع التذاكر
-│   ├── booking_orchestrator.py ← حجز متوازي
-│   ├── event_monitor.py    ← حلقات المراقبة الخلفية
-│   └── keep_alive.py       ← منع النوم
-└── bot/
-    ├── notifier.py         ← Telegram Bot API wrapper
-    ├── keyboards.py        ← جميع InlineKeyboards
-    ├── state.py            ← FSM للمحادثات متعددة الخطوات
-    └── handlers.py         ← dispatcher + جميع الـ handlers
-main.py                     ← FastAPI + lifespan + webhook
-```
-
----
-
-## 🚀 النشر على Render
-
-1. ادخل إلى [Render Dashboard](https://dashboard.render.com)
-2. Render سيلتقط `render.yaml` — Docker، خطة Free، منطقة Frankfurt
-3. عيّن متغيرات البيئة السرية:
+1. اربط هذا المستودع بحساب Render
+2. اضبط متغيرات البيئة الحرجة فقط (يدوياً، **لا تُحفظ في Git**):
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_CHAT_ID`
-4. اضغط Deploy — البوت سيرد على `/start` خلال دقائق
-
-**نصيحة:** أضف `https://your-app.onrender.com/ping` إلى [UptimeRobot](https://uptimerobot.com) مجاناً لضمان عدم النوم مطلقاً.
+   - `DATABASE_URL` (PostgreSQL)
+   - `CAPTCHA_API_KEY` (2captcha)
+   - `ADMIN_PASSWORD`
+3. باقي المتغيرات لها قيم افتراضية في `render.yaml`، أو يمكن تعديلها live من **/admin** أو من قائمة "⚙️ الإعدادات" في البوت.
 
 ---
 
-## ⚙️ متغيرات البيئة
+## ⚙️ نموذج الإعدادات الهجين
 
-| المتغير | الافتراضي | الوصف |
+| النوع | المكان | السبب |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | — | ❗ مطلوب |
-| `TELEGRAM_CHAT_ID` | — | ❗ مطلوب |
-| `AUTHORIZED_CHAT_IDS` | = CHAT_ID | معرفات مصرح لها إضافية (فواصل) |
-| `WEBOOK_LANG` | `en` | لغة API (en\|ar) |
-| `WEBOOK_PUBLIC_TOKEN` | ثابت | توكن العامة للـ webook |
-| `EVENT_POLL_INTERVAL` | `300` | ث بين فحوص اكتشاف الفعاليات |
-| `SNIPER_POLL_INTERVAL` | `2` | ث بين تكات القنّاص |
-| `KEEP_ALIVE_INTERVAL` | `600` | ث بين ping خارجي |
-| `LOGIN_CAPTCHA_TIMEOUT` | `180` | ث انتظار حل الـ captcha من المستخدم |
-| `SEATSIO_PREWARM_ENABLED` | `true` | تسخين خريطة المقاعد وحالاتها مسبقاً |
-| `SEATSIO_STALKER_ENABLED` | `true` | محاولة التقاط المقاعد المحررة سريعاً |
-| `TARGET_BLOCKS` | — | بلوكات مفضلة مثل `S1,S2,VIP` |
-| `CAPTCHA_API_KEY` | — | مفتاح 2captcha اختياري لتسجيل دخول آلي أقوى |
-| `PROXY_SERVER` | — | بروكسي مدفوع اختياري لزيادة الثبات |
-| `HEADLESS` | `true` | Chromium headless |
-| `LOG_LEVEL` | `INFO` | `DEBUG` لتفاصيل أكثر |
+| أسرار حرجة (Tokens, DB) | Render فقط | محمية، sealed |
+| متغيرات تشغيل (PAYMENT, INTERVALS) | DB (`bot_settings`) + ENV fallback | تعديل live بدون redeploy |
+| دفع موحّد لكل الحسابات | DB → ENV → `credit_card` | افتراضي |
+
+ترتيب الحلّ: `os.environ` → `bot_settings` (DB) → default.
 
 ---
 
-## ⚠️ قيود وتحذيرات
+## 🧪 Smoke Test
 
-- **webook يستخدم reCAPTCHA** — لا يمكن تجاوزه برمجياً. نحن نحوّله إليك لحلّه يدوياً مرة واحدة لكل login.
-- **طريقة الدفع PayTabs فقط** — webook لا يدعم PayPal. البوت يُرجع رابط PayTabs مباشرة وأنت تختار طريقة الدفع من صفحة PayTabs.
-- **الخطة المجانية من Render = 512MB RAM** — Playwright يُشغَّل لحظياً فقط عند login (حتى 60 ثانية)، ثم يُغلق. بقية العمليات HTTP خفيفة جداً.
-- هذا المشروع تعليمي. استخدام بوتات الحجز قد يخالف شروط الخدمة.
+```bash
+python smoke_test.py
+# → SMOKE_OK ✅ — v4 Hydra engine passes all checks
+```
+
+يفحص: config, block analyzer, geometric neighbors, find_seats_with_fallback, seat summarizer, bot settings round-trip.
+
+---
+
+## 🔗 Endpoints
+
+| | |
+|---|---|
+| `GET  /` | Dashboard |
+| `GET  /health` | فحص (مع backend & accounts ready) |
+| `GET  /ping` | Keep-alive |
+| `GET  /stats` | إحصائيات JSON |
+| `POST /telegram/webhook` | تحديثات تيليجرام |
+| `GET  /admin/` | لوحة إدارة (محمية بـ ADMIN_PASSWORD) |
+
+---
+
+## 📝 Changelog
+
+- **v4.0 (2026-05)** — Hydra Seat Engine; حذف Sniper + Watch Keywords; إضافة block picker + drop watcher + smart summarizer + bot_settings + per-event seat_maps cache.
+- v3.x — البنية الأصلية (HTTP-direct + Playwright fallback + sniper_loop + watch_keywords).

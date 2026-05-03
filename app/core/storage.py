@@ -4,9 +4,11 @@ Persistence layer backed by either Turso (cloud SQLite) or local sqlite3.
 Tables:
   • accounts       — email/password + JWT tokens per account
   • events         — cached events seen on Webook
-  • watch_keywords — keywords that trigger auto-alerts
   • bookings       — successful bookings (one row per account per booking)
-  • sniper_tasks   — active sniper tasks (user-triggered fast monitoring)
+  • bot_settings   — runtime-tunable settings managed via admin UI
+  • event_blocks   — user-selected primary/backup blocks per event
+  • drop_watchers  — accounts watching for seat drops on full charts
+  • seat_maps      — cached seats.io rendering_info per chart_key
 """
 from __future__ import annotations
 
@@ -51,12 +53,6 @@ def init_db() -> None:
             last_checked_at REAL
         );
 
-        CREATE TABLE IF NOT EXISTS watch_keywords (
-            keyword       TEXT PRIMARY KEY,
-            added_by      TEXT,
-            added_at      REAL
-        );
-
         CREATE TABLE IF NOT EXISTS bookings (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id         TEXT,
@@ -73,22 +69,52 @@ def init_db() -> None:
             created_at      REAL
         );
 
-        CREATE TABLE IF NOT EXISTS sniper_tasks (
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key           TEXT PRIMARY KEY,
+            value         TEXT,
+            updated_at    REAL,
+            updated_by    TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS event_blocks (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id         TEXT,
             event_slug      TEXT,
             ticket_type_id  TEXT,
+            primary_block   TEXT,
+            backup_blocks   TEXT,    -- JSON list, in order
             quantity        INTEGER,
-            status          TEXT DEFAULT 'active',
-            attempts        INTEGER DEFAULT 0,
+            payment_method  TEXT DEFAULT 'credit_card',
+            created_at      REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS drop_watchers (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id         TEXT,
+            account_id      TEXT,
+            event_slug      TEXT,
+            event_key       TEXT,
+            ticket_type_id  TEXT,
+            quantity        INTEGER,
+            blocks_pref     TEXT,     -- JSON list (primary,backup,neighbors)
+            status          TEXT DEFAULT 'watching',  -- watching/captured/cancelled
             created_at      REAL,
             updated_at      REAL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_events_last_seen  ON events(last_seen_at);
-        CREATE INDEX IF NOT EXISTS idx_events_start_date ON events(start_date);
-        CREATE INDEX IF NOT EXISTS idx_accounts_status   ON accounts(status);
-        CREATE INDEX IF NOT EXISTS idx_snipers_status    ON sniper_tasks(status);
+        CREATE TABLE IF NOT EXISTS seat_maps (
+            chart_key       TEXT PRIMARY KEY,
+            event_key       TEXT,
+            rendering_info  TEXT,     -- JSON
+            blocks_meta     TEXT,     -- JSON: [{name, center_x, center_y, free_count}]
+            updated_at      REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_last_seen   ON events(last_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_events_start_date  ON events(start_date);
+        CREATE INDEX IF NOT EXISTS idx_accounts_status    ON accounts(status);
+        CREATE INDEX IF NOT EXISTS idx_dropwatch_status   ON drop_watchers(status);
+        CREATE INDEX IF NOT EXISTS idx_blocks_chat        ON event_blocks(chat_id);
         """)
 
 
@@ -225,33 +251,6 @@ def list_recent_events(limit: int = 20) -> list[dict[str, Any]]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Watch keywords
-# ════════════════════════════════════════════════════════════════════════
-def add_keyword(keyword: str, added_by: str = "system") -> None:
-    with _conn() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO watch_keywords (keyword, added_by, added_at) "
-            "VALUES (?, ?, ?)",
-            (keyword.lower().strip(), added_by, time.time()),
-        )
-
-
-def remove_keyword(keyword: str) -> None:
-    with _conn() as con:
-        con.execute(
-            "DELETE FROM watch_keywords WHERE keyword = ?",
-            (keyword.lower().strip(),),
-        )
-
-
-def list_keywords() -> list[str]:
-    with _conn() as con:
-        return [r["keyword"] for r in con.execute(
-            "SELECT keyword FROM watch_keywords ORDER BY added_at"
-        ).fetchall()]
-
-
-# ════════════════════════════════════════════════════════════════════════
 # Bookings
 # ════════════════════════════════════════════════════════════════════════
 def add_booking(chat_id: str, event_slug: str, event_title: str,
@@ -294,37 +293,163 @@ def list_bookings(chat_id: Optional[str] = None,
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Sniper tasks
+# Drop watchers (replaces old sniper system — fires on actual seat drops,
+# not on speed-based polling)
 # ════════════════════════════════════════════════════════════════════════
-def add_sniper(chat_id: str, event_slug: str, ticket_type_id: str,
-               quantity: int) -> int:
+def add_drop_watcher(*, chat_id: str, account_id: str, event_slug: str,
+                    event_key: str, ticket_type_id: str, quantity: int,
+                    blocks_pref: list[str]) -> int:
     with _conn() as con:
         cur = con.execute("""
-            INSERT INTO sniper_tasks (chat_id, event_slug, ticket_type_id,
-                                      quantity, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (chat_id, event_slug, ticket_type_id, quantity,
+            INSERT INTO drop_watchers (chat_id, account_id, event_slug,
+                                       event_key, ticket_type_id, quantity,
+                                       blocks_pref, status, created_at,
+                                       updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?)
+        """, (chat_id, account_id, event_slug, event_key, ticket_type_id,
+              quantity, json.dumps(blocks_pref, ensure_ascii=False),
               time.time(), time.time()))
         return cur.lastrowid
 
 
-def list_snipers(status: Optional[str] = None) -> list[dict[str, Any]]:
-    q = "SELECT * FROM sniper_tasks"
+def list_drop_watchers(status: Optional[str] = "watching",
+                       event_key: Optional[str] = None) -> list[dict[str, Any]]:
+    q = "SELECT * FROM drop_watchers WHERE 1=1"
     params: list[Any] = []
     if status:
-        q += " WHERE status = ?"
+        q += " AND status = ?"
         params.append(status)
-    q += " ORDER BY created_at DESC"
+    if event_key:
+        q += " AND event_key = ?"
+        params.append(event_key)
+    q += " ORDER BY created_at"
     with _conn() as con:
-        return [dict(r) for r in con.execute(q, params).fetchall()]
+        rows = [dict(r) for r in con.execute(q, params).fetchall()]
+    for r in rows:
+        try:
+            r["blocks_pref"] = json.loads(r.get("blocks_pref") or "[]")
+        except Exception:
+            r["blocks_pref"] = []
+    return rows
 
 
-def set_sniper_status(task_id: int, status: str) -> None:
+def set_drop_watcher_status(watcher_id: int, status: str) -> None:
     with _conn() as con:
         con.execute(
-            "UPDATE sniper_tasks SET status = ?, updated_at = ? WHERE id = ?",
-            (status, time.time(), task_id),
+            "UPDATE drop_watchers SET status = ?, updated_at = ? WHERE id = ?",
+            (status, time.time(), watcher_id),
         )
+
+
+def cancel_drop_watchers(chat_id: str) -> int:
+    with _conn() as con:
+        cur = con.execute(
+            "UPDATE drop_watchers SET status='cancelled', updated_at=? "
+            "WHERE chat_id = ? AND status='watching'",
+            (time.time(), chat_id),
+        )
+        return cur.rowcount or 0
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Bot settings (runtime-tunable via /admin UI)
+# ════════════════════════════════════════════════════════════════════════
+def set_bot_setting(key: str, value: str, updated_by: str = "admin") -> None:
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO bot_settings (key, value, updated_at, updated_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+        """, (key, value, time.time(), updated_by))
+
+
+def get_bot_setting(key: str, default: str = "") -> str:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT value FROM bot_settings WHERE key = ?", (key,)
+        ).fetchone()
+        return (row["value"] if row else default) or default
+
+
+def list_bot_settings() -> dict[str, str]:
+    with _conn() as con:
+        return {r["key"]: r["value"]
+                for r in con.execute("SELECT key, value FROM bot_settings").fetchall()}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Event blocks selection (user picks primary + backup blocks)
+# ════════════════════════════════════════════════════════════════════════
+def save_event_blocks(*, chat_id: str, event_slug: str, ticket_type_id: str,
+                     primary_block: str, backup_blocks: list[str],
+                     quantity: int, payment_method: str = "credit_card") -> int:
+    with _conn() as con:
+        cur = con.execute("""
+            INSERT INTO event_blocks (chat_id, event_slug, ticket_type_id,
+                                     primary_block, backup_blocks, quantity,
+                                     payment_method, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (chat_id, event_slug, ticket_type_id, primary_block,
+              json.dumps(backup_blocks, ensure_ascii=False), quantity,
+              payment_method, time.time()))
+        return cur.lastrowid
+
+
+def get_event_blocks(blocks_id: int) -> Optional[dict[str, Any]]:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM event_blocks WHERE id = ?", (blocks_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["backup_blocks"] = json.loads(d.get("backup_blocks") or "[]")
+        except Exception:
+            d["backup_blocks"] = []
+        return d
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Seat maps cache (reusable across booking sessions)
+# ════════════════════════════════════════════════════════════════════════
+def save_seat_map(*, chart_key: str, event_key: str, rendering_info: dict,
+                 blocks_meta: list[dict]) -> None:
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO seat_maps (chart_key, event_key, rendering_info,
+                                   blocks_meta, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chart_key) DO UPDATE SET
+                event_key = excluded.event_key,
+                rendering_info = excluded.rendering_info,
+                blocks_meta = excluded.blocks_meta,
+                updated_at = excluded.updated_at
+        """, (chart_key, event_key,
+              json.dumps(rendering_info, ensure_ascii=False),
+              json.dumps(blocks_meta, ensure_ascii=False),
+              time.time()))
+
+
+def get_seat_map(chart_key: str, max_age: float = 86400) -> Optional[dict[str, Any]]:
+    with _conn() as con:
+        row = con.execute(
+            "SELECT * FROM seat_maps WHERE chart_key = ?", (chart_key,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if (time.time() - float(d.get("updated_at") or 0)) > max_age:
+            return None
+        try:
+            d["rendering_info"] = json.loads(d.get("rendering_info") or "{}")
+            d["blocks_meta"] = json.loads(d.get("blocks_meta") or "[]")
+        except Exception:
+            pass
+        return d
 
 
 # Initialize on import so any module that imports us gets a ready DB

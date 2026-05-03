@@ -21,9 +21,19 @@ load_dotenv()
 
 # ── helpers ───────────────────────────────────────────────────────────────
 def _env_or(key: str, default: str = "") -> str:
+    """Resolution order: os.environ → bot_settings (DB) → legacy settings → default."""
     v = os.environ.get(key)
     if v:
         return v
+    # New unified bot_settings table
+    try:
+        from app.core.storage import get_bot_setting
+        val = get_bot_setting(key, "")
+        if val:
+            return val
+    except Exception:
+        pass
+    # Legacy fallback
     try:
         from app.core import settings as _s
         return _s.get(key, default)
@@ -51,29 +61,16 @@ WEBOOK_LANG = os.getenv("WEBOOK_LANG", "ar")
 
 # ── Monitoring ─────────────────────────────────────────────────────────
 EVENT_POLL_INTERVAL = int(os.getenv("EVENT_POLL_INTERVAL", "300"))
-SNIPER_POLL_INTERVAL = float(os.getenv("SNIPER_POLL_INTERVAL", "2"))
-
-DEFAULT_WATCH_KEYWORDS = [
-    k.strip() for k in os.getenv(
-        "DEFAULT_WATCH_KEYWORDS",
-        "al-hilal,al-nassr,al-ittihad,al-ahli,hilal,nassr,ittihad,ahli,"
-        "saudi-league,saudi-pro-league,spl,super-cup,kings-cup,"
-        "riyadh-season,riyadh-boulevard,boulevard,boulevard-world,"
-        "mdl-beast,mdl,soundstorm,"
-        "concert,festival,f1,formula-1,grand-prix,gp,"
-        "هلال,نصر,اتحاد,أهلي,موسم الرياض,بوليفارد"
-    ).split(",") if k.strip()
-]
 
 LOGIN_CAPTCHA_TIMEOUT = int(os.getenv("LOGIN_CAPTCHA_TIMEOUT", "180"))
 TOKEN_REFRESH_MARGIN = int(os.getenv("TOKEN_REFRESH_MARGIN", "300"))
 
 # ── Paths ──────────────────────────────────────────────────────────────
 DATA_DIR = os.getenv("DATA_DIR", "data")
-DB_PATH = os.getenv("DB_PATH", f"{DATA_DIR}/sniper.db")
+DB_PATH = os.getenv("DB_PATH", f"{DATA_DIR}/webook_bot.db")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
 LOGS_DIR = os.getenv("LOGS_DIR", "logs")
-LOG_FILE = os.getenv("LOG_FILE", f"{LOGS_DIR}/sniper.log")
+LOG_FILE = os.getenv("LOG_FILE", f"{LOGS_DIR}/webook_bot.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
@@ -130,21 +127,33 @@ def seatsio_status_interval() -> float:
     return float(_env_or("SEATSIO_STATUS_INTERVAL", "0.60"))
 
 
-def seatsio_stalker_enabled() -> bool:
-    return _env_bool("SEATSIO_STALKER_ENABLED", True)
+def seatsio_drop_watcher_enabled() -> bool:
+    """Drop-watcher mode replaces the old speed-based stalker. It only
+    activates when a chart is fully booked, then waits on WebSocket
+    drop events."""
+    return _env_bool("SEATSIO_DROP_WATCHER_ENABLED", True)
 
 
-def seatsio_stalker_max_wait() -> float:
-    return float(_env_or("SEATSIO_STALKER_MAX_WAIT", "45"))
-
-
-def seatsio_stalker_poll_interval() -> float:
-    return float(_env_or("SEATSIO_STALKER_POLL_INTERVAL", "0.50"))
+def seatsio_drop_watcher_max_wait() -> float:
+    return float(_env_or("SEATSIO_DROP_WATCHER_MAX_WAIT", "1800"))
 
 
 def target_blocks() -> list[str]:
+    """Legacy global block preference — the new flow uses per-event
+    primary/backup block selection (see app.core.storage.event_blocks).
+    Kept as a fallback only.
+    """
     raw = _env_or("TARGET_BLOCKS", "")
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def default_payment_method() -> str:
+    """Unified default payment method applied to every account unless the
+    operator explicitly switches to Apple Pay. Defaults to credit_card.
+    Allowed: 'credit_card' | 'apple_pay'.
+    """
+    raw = (_env_or("DEFAULT_PAYMENT_METHOD", "credit_card") or "credit_card").strip().lower()
+    return "apple_pay" if raw in {"apple_pay", "applepay", "apple"} else "credit_card"
 
 
 # ── Paid reliability enhancers ─────────────────────────────────────────
@@ -178,3 +187,4 @@ WEBOOK_PUBLIC_TOKEN = webook_public_token()
 SEATSIO_ENABLED = seatsio_enabled()
 SEATSIO_PREWARM_ENABLED = seatsio_prewarm_enabled()
 USE_STEALTH_BROWSER = use_stealth_browser()
+DEFAULT_PAYMENT_METHOD = default_payment_method()

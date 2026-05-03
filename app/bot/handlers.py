@@ -1,45 +1,62 @@
-"""Telegram update dispatcher — 100% button-driven, all Arabic UI."""
+"""Telegram update dispatcher — 100% button-driven, all Arabic UI.
+
+v4 workflow:
+  1. User sends an event link (or picks from list)
+  2. Bot fetches seats.io rendering_info immediately and shows blocks
+  3. User picks PRIMARY block, then BACKUP blocks (S1, S2, ...)
+  4. User sends quantity → bot confirms → executes booking
+  5. Booking algorithm: adjacency → backup blocks → geometric expansion →
+     drop-watcher when chart fully booked
+  6. Output uses smart seat summarization
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
+from urllib.parse import urlparse
 
 from app.bot import keyboards as kb
 from app.bot import state as fsm
 from app.bot import tokens as tok
 from app.bot.notifier import Notifier
-from app.core.config import DEFAULT_WATCH_KEYWORDS, authorized_chat_ids
+from app.core.config import authorized_chat_ids, default_payment_method
 from app.core.storage import (
-    add_keyword, delete_account, get_account, list_accounts, list_bookings,
-    list_keywords, list_recent_events, remove_keyword, upsert_account,
-    upsert_event,
+    delete_account, get_account, list_accounts, list_bookings,
+    list_recent_events, upsert_account, upsert_event, set_bot_setting,
+    get_bot_setting,
 )
 from app.services import auth_service
+from app.services.block_analyzer import extract_blocks
 from app.services.booking_orchestrator import book_all
 from app.services.distributor import describe_plan, distribute
 from app.services.event_discovery import enrich_all, fetch_event_slugs
+from app.services.seat_summarizer import summarize_for_telegram
+from app.services.seatsio_client import SeatsioClient
+from app.services.seatsio_runtime import ensure_event_warm
 from app.services.webook_api import get_event_detail, get_event_tickets
 
 log = logging.getLogger("handlers")
 
 WELCOME = (
-    "👋 <b>أهلاً بك في بوت حجز التذاكر</b>\n\n"
-    "يعرض لك أحدث فعاليات webook.com ويحجز على حساباتك بالتوازي، ثم "
-    "يرجع لك روابط الدفع جاهزة.\n\n"
+    "👋 <b>أهلاً بك في بوت Webook</b>\n\n"
+    "أرسل رابط فعالية ↗️ أو اختر من قائمة الفعاليات.\n"
+    "البوت يتعامل مباشرةً مع خرائط seats.io ويحجز مقاعد متجاورة بذكاء.\n\n"
     "اختر من القائمة:"
 )
 
 HELP = (
     "🆘 <b>طريقة الاستخدام</b>\n\n"
-    "الخطوات:\n"
     "1️⃣ من <b>إدارة الحسابات</b> أضف حساباً أو أكثر\n"
-    "2️⃣ اضغط <b>تسجيل الدخول</b> لكل حساب (مرة واحدة فقط)\n"
-    "3️⃣ من <b>الفعاليات الجارية</b> اختر فعالية\n"
+    "2️⃣ اضغط <b>تسجيل الدخول</b> لكل حساب (مرة واحدة)\n"
+    "3️⃣ أرسل <b>رابط الفعالية</b> أو اختر من القائمة\n"
     "4️⃣ اختر نوع التذكرة\n"
-    "5️⃣ أرسل عدد التذاكر كرسالة نصية\n"
-    "6️⃣ اضغط تأكيد — سيأتيك رابط الدفع لكل حساب\n\n"
+    "5️⃣ <b>اختر المربع الرئيسي + المربعات الاحتياطية</b>\n"
+    "6️⃣ أرسل عدد التذاكر — البوت يحجز مقاعد متجاورة تلقائياً\n\n"
+    "🎯 إذا الخريطة ممتلئة → يدخل وضع الترقّب لاصطياد المقاعد الساقطة.\n"
+    "💳 طريقة الدفع الافتراضية: بطاقة ائتمانية (قابلة للتغيير من الإعدادات).\n"
     "💡 <i>التوكن صالح ~٧ أيام ويُجدَّد تلقائياً.</i>"
 )
 
@@ -60,6 +77,27 @@ async def dispatch(update: dict, notifier: Notifier) -> None:
 def _authorized(chat_id: str) -> bool:
     ids = authorized_chat_ids()
     return not ids or str(chat_id) in ids
+
+
+def _extract_slug_from_link(text: str) -> str | None:
+    """Parse 'https://webook.com/ar/events/<slug>' or '<slug>' into slug."""
+    text = text.strip()
+    if not text:
+        return None
+    if text.startswith("http"):
+        try:
+            p = urlparse(text)
+            parts = [x for x in p.path.split("/") if x]
+            # patterns: /ar/events/<slug>  or /en/events/<slug>/book
+            for i, seg in enumerate(parts):
+                if seg == "events" and i + 1 < len(parts):
+                    return parts[i + 1]
+        except Exception:
+            return None
+    # treat raw text as slug only if it looks like one (lowercase/digits/hyphens)
+    if re.fullmatch(r"[a-z0-9][a-z0-9\-]{2,}", text):
+        return text
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -98,32 +136,41 @@ async def _on_message(msg: dict, notifier: Notifier) -> None:
             )
             return
 
+        if st.name == "waiting_event_link":
+            slug = _extract_slug_from_link(text)
+            fsm.clear_state(chat_id)
+            if not slug:
+                await notifier.send(
+                    chat_id,
+                    "⚠️ تعذّر استخراج رابط الفعالية. أرسل رابطاً مثل:\n"
+                    "<code>https://webook.com/ar/events/some-slug</code>",
+                    reply_markup=kb.back_to_menu())
+                return
+            await _show_event(chat_id, slug, notifier)
+            return
+
         if st.name == "waiting_qty":
-            ctx = st.data  # {slug, ticket_id, ticket_token}
+            ctx = st.data
             try:
                 n = int(text.strip())
                 if n <= 0:
                     raise ValueError
             except ValueError:
-                await notifier.send(
-                    chat_id, "⚠️ أرسل عدداً صحيحاً موجباً فقط.")
+                await notifier.send(chat_id,
+                                     "⚠️ أرسل عدداً صحيحاً موجباً فقط.")
                 return
             fsm.clear_state(chat_id)
             await _show_plan(chat_id, ctx["slug"], ctx["ticket_id"],
-                             n, notifier)
+                             ctx.get("session_token", ""), n, notifier)
             return
 
-        if st.name == "waiting_keyword":
-            add_keyword(text, added_by=chat_id)
-            fsm.clear_state(chat_id)
-            await notifier.send(
-                chat_id,
-                f"✅ تمت إضافة الكلمة: <code>{text}</code>",
-                reply_markup=kb.watch_keyboard(list_keywords()),
-            )
-            return
+    # plain text could be an event link
+    slug = _extract_slug_from_link(text)
+    if slug:
+        await _show_event(chat_id, slug, notifier)
+        return
 
-    # /start or any other text → open main menu
+    # otherwise → main menu
     await notifier.send(chat_id, WELCOME, reply_markup=kb.main_menu())
 
 
@@ -161,7 +208,41 @@ async def _route(chat_id: str, msg_id: int, data: str,
         await notifier.edit(chat_id, msg_id, HELP,
                             reply_markup=kb.back_to_menu()); return
 
-    # Events
+    # Direct link prompt
+    if data == "link:prompt":
+        fsm.set_state(chat_id, "waiting_event_link")
+        await notifier.edit(
+            chat_id, msg_id,
+            "🔗 <b>أرسل رابط الفعالية</b>\n\n"
+            "مثال:\n<code>https://webook.com/ar/events/event-slug</code>",
+            reply_markup=kb.back_to_menu(),
+        ); return
+
+    # Settings
+    if data == "settings:menu":
+        current = get_bot_setting("DEFAULT_PAYMENT_METHOD",
+                                  default_payment_method())
+        await notifier.edit(
+            chat_id, msg_id,
+            f"⚙️ <b>الإعدادات العامة</b>\n\n"
+            f"💳 <b>طريقة الدفع الحالية:</b> "
+            f"{'بطاقة ائتمانية' if current=='credit_card' else 'Apple Pay'}\n\n"
+            f"تنطبق على <b>جميع الحسابات</b> بشكل موحّد.",
+            reply_markup=kb.settings_keyboard(current),
+        ); return
+    if data.startswith("settings:pay:"):
+        method = data.split(":", 2)[2]
+        if method not in {"credit_card", "apple_pay"}:
+            method = "credit_card"
+        set_bot_setting("DEFAULT_PAYMENT_METHOD", method, updated_by=chat_id)
+        await notifier.edit(
+            chat_id, msg_id,
+            f"✅ تم ضبط طريقة الدفع → "
+            f"{'💳 بطاقة ائتمانية' if method=='credit_card' else '🍎 Apple Pay'}",
+            reply_markup=kb.settings_keyboard(method),
+        ); return
+
+    # Events list
     if data.startswith("events:"):
         arg = data.split(":", 1)[1]
         await _show_events(chat_id, msg_id, arg, notifier); return
@@ -169,10 +250,8 @@ async def _route(chat_id: str, msg_id: int, data: str,
         t = data.split(":", 1)[1]
         entry = tok.get(t)
         if not entry:
-            await notifier.edit(chat_id, msg_id,
-                                "انتهت صلاحية هذا الرابط.",
-                                reply_markup=kb.back_to_menu())
-            return
+            await notifier.edit(chat_id, msg_id, "انتهت صلاحية هذا الرابط.",
+                                reply_markup=kb.back_to_menu()); return
         await _show_event(chat_id, entry["slug"], notifier,
                           edit_msg_id=msg_id, event_token=t)
         return
@@ -180,22 +259,28 @@ async def _route(chat_id: str, msg_id: int, data: str,
         t = data.split(":", 1)[1]
         entry = tok.get(t)
         if not entry:
-            await notifier.edit(chat_id, msg_id,
-                                "انتهت صلاحية هذا الرابط.",
+            await notifier.edit(chat_id, msg_id, "انتهت صلاحية هذا الرابط.",
                                 reply_markup=kb.back_to_menu()); return
-        await _ask_quantity(chat_id, entry["slug"], entry["ticket_id"],
-                            msg_id, notifier)
+        await _start_block_picker(chat_id, msg_id,
+                                   entry["slug"], entry["ticket_id"],
+                                   notifier)
         return
+
+    # Block picker actions
+    if data.startswith("blk:"):
+        await _route_blocks(chat_id, msg_id, data, notifier); return
+
     if data.startswith("go:"):
         t = data.split(":", 1)[1]
         entry = tok.get(t)
         if not entry:
-            await notifier.edit(chat_id, msg_id,
-                                "انتهت صلاحية هذا الرابط.",
+            await notifier.edit(chat_id, msg_id, "انتهت صلاحية هذا الرابط.",
                                 reply_markup=kb.back_to_menu()); return
         await _execute_booking(
             chat_id, msg_id,
             entry["slug"], entry["ticket_id"], entry["qty"],
+            entry.get("primary_block", ""),
+            entry.get("backup_blocks", []),
             notifier,
         )
         return
@@ -227,36 +312,210 @@ async def _route(chat_id: str, msg_id: int, data: str,
     if data == "bookings:list":
         await _show_bookings(chat_id, notifier, edit_msg_id=msg_id); return
 
-    # Watch keywords
-    if data == "watch:list":
-        kws = list_keywords()
-        if not kws:
-            for k in DEFAULT_WATCH_KEYWORDS:
-                add_keyword(k, "system")
-            kws = list_keywords()
+
+# ════════════════════════════════════════════════════════════════════════
+# Block picker (NEW)
+# ════════════════════════════════════════════════════════════════════════
+# session_token → {slug, ticket_id, blocks_meta, primary, backups, mode}
+_PICKER_SESSIONS: dict[str, dict] = {}
+
+
+async def _start_block_picker(chat_id: str, msg_id: int,
+                               slug: str, ticket_id: str,
+                               notifier: Notifier) -> None:
+    """Step 2: fetch event_key + rendering_info → show blocks list."""
+    await notifier.edit(
+        chat_id, msg_id,
+        "🔄 جارٍ جلب بيانات seats.io للفعالية...",
+        reply_markup=None,
+    )
+
+    # 1) Get event_key from webook + ticket details
+    import aiohttp
+    from app.services.booking_http import (
+        fetch_event_meta, resolve_seated_manifest,
+    )
+    async with aiohttp.ClientSession() as session:
+        meta = await fetch_event_meta(session, slug, "")
+        if not meta.get("is_seated"):
+            # No seats.io chart → skip block picker, go straight to qty
+            await notifier.edit(
+                chat_id, msg_id,
+                "ℹ️ هذه الفعالية بدون خريطة مقاعد — انتقل لإدخال العدد.",
+                reply_markup=None,
+            )
+            await _ask_quantity_no_blocks(chat_id, msg_id, slug, ticket_id, notifier)
+            return
+        manifest = await resolve_seated_manifest(
+            session, slug, ticket_id, "", event_meta=meta,
+        )
+
+    event_key = manifest.get("event_key") or ""
+    if not event_key:
         await notifier.edit(
             chat_id, msg_id,
-            "👁️ <b>كلمات المراقبة</b>\n\n"
-            "سيصلك تنبيه عند ظهور فعالية جديدة تحتوي أياً منها.",
-            reply_markup=kb.watch_keyboard(kws)); return
-    if data == "watch:add":
-        fsm.set_state(chat_id, "waiting_keyword")
-        await notifier.send(chat_id, "➕ أرسل الكلمة:"); return
-    if data.startswith("watch:del:"):
-        kw = data.split(":", 2)[2]
-        remove_keyword(kw)
-        await notifier.edit(chat_id, msg_id, "👁️ <b>كلمات المراقبة</b>",
-                            reply_markup=kb.watch_keyboard(list_keywords()))
+            "⚠️ تعذّر استخراج مفتاح seats.io للفعالية.\n"
+            "جرّب من المتصفح يدوياً.",
+            reply_markup=kb.back_to_menu(),
+        ); return
+
+    # 2) Get rendering_info + statuses
+    try:
+        await ensure_event_warm(event_key)
+        async with SeatsioClient(event_key) as client:
+            rendering_info = await client.rendering_info()
+            statuses = await client.object_statuses()
+    except Exception as e:
+        await notifier.edit(
+            chat_id, msg_id,
+            f"⚠️ فشل الاتصال بـ seats.io: <code>{str(e)[:120]}</code>",
+            reply_markup=kb.back_to_menu(),
+        ); return
+
+    blocks_meta = extract_blocks(rendering_info, statuses)
+    if not blocks_meta:
+        await notifier.edit(
+            chat_id, msg_id,
+            "⚠️ لم أتمكّن من قراءة بلوكات الخريطة.\n"
+            "ربما الفعالية لم يبدأ بيعها بعد.",
+            reply_markup=kb.back_to_menu(),
+        ); return
+
+    # Cache the seat map for reuse
+    try:
+        from app.core.storage import save_seat_map
+        save_seat_map(
+            chart_key=event_key, event_key=event_key,
+            rendering_info=rendering_info,
+            blocks_meta=[{"name": b["name"], "free": b["free"],
+                          "total": b["total"]} for b in blocks_meta],
+        )
+    except Exception:
+        pass
+
+    session_token = uuid.uuid4().hex[:10]
+    _PICKER_SESSIONS[session_token] = {
+        "slug": slug,
+        "ticket_id": ticket_id,
+        "event_key": event_key,
+        "blocks_meta": blocks_meta,
+        "primary": "",
+        "backups": [],
+        "mode": "primary",
+    }
+
+    free_total = sum(b["free"] for b in blocks_meta)
+    txt = (
+        f"🗺️ <b>اختر البلوكات</b>\n\n"
+        f"📊 إجمالي البلوكات: <b>{len(blocks_meta)}</b>\n"
+        f"🟢 مقاعد متاحة الآن: <b>{free_total}</b>\n\n"
+        f"1️⃣ اضغط على بلوك ليصبح <b>الرئيسي ⭐</b>\n"
+        f"2️⃣ بدّل لـ «وضع الاحتياطي» وأضف S2, S3...\n"
+        f"3️⃣ اضغط <b>تأكيد البلوكات</b> للمتابعة"
+    )
+    await notifier.edit(
+        chat_id, msg_id, txt,
+        reply_markup=kb.blocks_picker_keyboard(
+            blocks_meta, session_token, primary="", backups=[],
+            mode="primary",
+        ),
+    )
+
+
+async def _route_blocks(chat_id: str, msg_id: int, data: str,
+                         notifier: Notifier) -> None:
+    """Handles all blk:* callbacks."""
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+    op = parts[1]
+    sess_tok = parts[2]
+    sess = _PICKER_SESSIONS.get(sess_tok)
+    if not sess:
+        await notifier.edit(chat_id, msg_id,
+                            "⚠️ انتهت جلسة اختيار البلوكات.",
+                            reply_markup=kb.back_to_menu()); return
+
+    blocks_meta = sess["blocks_meta"]
+
+    if op == "setmode":
+        sess["mode"] = parts[3] if len(parts) > 3 else "primary"
+        await notifier.edit(
+            chat_id, msg_id,
+            _build_picker_caption(sess),
+            reply_markup=kb.blocks_picker_keyboard(
+                blocks_meta, sess_tok,
+                primary=sess["primary"], backups=sess["backups"],
+                mode=sess["mode"],
+            ),
+        ); return
+
+    if op in ("primary", "backup"):
+        block_name_safe = parts[3] if len(parts) > 3 else ""
+        # match against actual block names (which may contain spaces)
+        actual = next(
+            (b["name"] for b in blocks_meta
+             if b["name"].replace(":", "_").replace(" ", "_")[:20] == block_name_safe),
+            None,
+        )
+        if not actual:
+            return
+        if op == "primary":
+            sess["primary"] = actual
+            # remove from backups if duplicate
+            sess["backups"] = [b for b in sess["backups"] if b != actual]
+        else:  # backup toggle
+            if actual == sess["primary"]:
+                # promoting/demoting handled implicitly
+                return
+            if actual in sess["backups"]:
+                sess["backups"].remove(actual)
+            else:
+                sess["backups"].append(actual)
+        await notifier.edit(
+            chat_id, msg_id,
+            _build_picker_caption(sess),
+            reply_markup=kb.blocks_picker_keyboard(
+                blocks_meta, sess_tok,
+                primary=sess["primary"], backups=sess["backups"],
+                mode=sess["mode"],
+            ),
+        ); return
+
+    if op == "done":
+        if not sess["primary"]:
+            await notifier.edit(
+                chat_id, msg_id,
+                "⚠️ <b>اختر البلوك الرئيسي أولاً</b>\n\n"
+                "تأكد أن أحد البلوكات معلّم بـ ⭐",
+                reply_markup=kb.blocks_picker_keyboard(
+                    blocks_meta, sess_tok,
+                    primary=sess["primary"], backups=sess["backups"],
+                    mode=sess["mode"],
+                ),
+            ); return
+        # → ask quantity
+        await _ask_quantity(chat_id, msg_id, sess["slug"], sess["ticket_id"],
+                             sess_tok, notifier)
         return
 
-    if data == "sniper:menu":
-        await notifier.edit(
-            chat_id, msg_id,
-            "🔥 <b>قنّاص سباق الثواني</b>\n\n"
-            "يراقب فعالية محدّدة كل ثانيتين ويحجز فور افتتاح البيع.\n\n"
-            "افتح <b>🎫 الفعاليات الجارية</b> → اختر فعالية تنتظر افتتاحها "
-            "→ سيظهر خيار تفعيل القنّاص.",
-            reply_markup=kb.back_to_menu()); return
+
+def _build_picker_caption(sess: dict) -> str:
+    blocks_meta = sess["blocks_meta"]
+    free_total = sum(b["free"] for b in blocks_meta)
+    primary = sess["primary"] or "—"
+    backups_str = (" → ".join(sess["backups"])) if sess["backups"] else "—"
+    mode_lbl = "🟢 الوضع الحالي: <b>اختيار الرئيسي ⭐</b>" \
+        if sess["mode"] == "primary" else \
+        "🔁 الوضع الحالي: <b>اختيار الاحتياطي</b>"
+    return (
+        f"🗺️ <b>اختر البلوكات</b>\n\n"
+        f"⭐ الرئيسي: <code>{primary}</code>\n"
+        f"🔁 الاحتياطية: <code>{backups_str}</code>\n"
+        f"🟢 إجمالي مقاعد متاحة: <b>{free_total}</b>\n\n"
+        f"{mode_lbl}\n\n"
+        f"بعد الانتهاء اضغط <b>✅ تأكيد البلوكات</b>"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -304,7 +563,6 @@ async def _show_events(chat_id: str, msg_id: int, arg: str,
 async def _show_event(chat_id: str, slug: str, notifier: Notifier,
                       edit_msg_id: int | None = None,
                       event_token: str | None = None) -> None:
-    # Fetch BOTH detail (authoritative title) + tickets in parallel
     detail_task = asyncio.create_task(get_event_detail(slug))
     tix_task = asyncio.create_task(get_event_tickets(slug))
     detail = await detail_task
@@ -322,7 +580,6 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
     title = (detail or {}).get("title") or (data or {}).get("event", {}).get("title") or slug
     sub = (detail or {}).get("sub_title") or ""
     desc_raw = (detail or {}).get("description") or ""
-    import re
     desc = re.sub(r"<[^>]+>", " ", desc_raw)
     desc = re.sub(r"\s+", " ", desc).strip()[:300]
 
@@ -340,7 +597,6 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
         txt += "اختر نوع التذكرة:"
         rkb = kb.ticket_types_keyboard(slug, tickets)
     else:
-        # Maybe it's a subscription event or sale not yet open
         txt += "\n⚠️ <i>لا توجد تذاكر متاحة حالياً عبر API.</i>\n"
         txt += ("قد تكون الفعالية تتطلب اشتراكاً، أو لم يُفتح بيعها بعد، "
                 "أو تُباع بطريقة مختلفة (مثل seats.io). "
@@ -358,9 +614,9 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
         await notifier.send(chat_id, txt, reply_markup=rkb)
 
 
-async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
-                        msg_id: int, notifier: Notifier) -> None:
-    """Step 1 of booking — show ticket info then ask user for quantity."""
+async def _ask_quantity(chat_id: str, msg_id: int, slug: str, ticket_id: str,
+                         session_token: str, notifier: Notifier) -> None:
+    """Step 3: after blocks picked, ask for quantity."""
     data = await get_event_tickets(slug)
     ticket = next(
         (t for t in (data.get("tickets") or []) if t["id"] == ticket_id),
@@ -373,7 +629,6 @@ async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
 
     accounts = [a for a in list_accounts(status="ready")
                 if a.get("access_token")]
-
     price = ticket.get("display_price") or 0
     ccy = kb._ccy(ticket.get("currency") or "SAR")
     price_str = f"{kb._fmt_price(price)} {ccy}" if price else "يظهر عند الحجز"
@@ -382,25 +637,27 @@ async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
     min_q = ticket.get("min_per_order", 1)
 
     if len(accounts) == 0:
-        txt = (
-            f"🎫 <b>{ticket['title']}</b>\n"
-            f"💰 السعر: <b>{price_str}</b>\n\n"
+        await notifier.edit(
+            chat_id, msg_id,
+            f"🎫 <b>{ticket['title']}</b>\n💰 السعر: <b>{price_str}</b>\n\n"
             f"⚠️ لا يوجد لديك حسابات مُفعّلة بعد.\n"
-            f"أضف حساباً من <b>إدارة الحسابات</b> أولاً."
-        )
-        await notifier.edit(chat_id, msg_id, txt,
-                            reply_markup=kb.back_to_menu())
-        return
+            f"أضف حساباً من <b>إدارة الحسابات</b> أولاً.",
+            reply_markup=kb.back_to_menu(),
+        ); return
 
-    # Store context so the user's next text reply is mapped back here
-    fsm.set_state(
-        chat_id, "waiting_qty",
-        slug=slug, ticket_id=ticket_id,
-    )
+    fsm.set_state(chat_id, "waiting_qty",
+                   slug=slug, ticket_id=ticket_id,
+                   session_token=session_token)
+
+    sess = _PICKER_SESSIONS.get(session_token, {})
+    primary = sess.get("primary", "—")
+    backups = " → ".join(sess.get("backups", [])) or "—"
 
     txt = (
         f"🎫 <b>{ticket['title']}</b>\n\n"
         f"💰 السعر: <b>{price_str}</b>\n"
+        f"⭐ البلوك الرئيسي: <code>{primary}</code>\n"
+        f"🔁 الاحتياطية: <code>{backups}</code>\n"
         f"👥 حسابات جاهزة: <b>{len(accounts)}</b>\n"
         f"📊 الحد الأقصى لكل حساب: <b>{ticket['max_per_order']}</b>\n"
         f"🧮 أقصى إجمالي يمكنك حجزه: <b>{max_cap}</b>\n"
@@ -411,8 +668,19 @@ async def _ask_quantity(chat_id: str, slug: str, ticket_id: str,
                         reply_markup=kb.back_to_menu())
 
 
-async def _show_plan(chat_id: str, slug: str, ticket_id: str, qty: int,
-                     notifier: Notifier) -> None:
+async def _ask_quantity_no_blocks(chat_id: str, msg_id: int, slug: str,
+                                    ticket_id: str, notifier: Notifier) -> None:
+    """Quantity prompt for non-seated events (no blocks needed)."""
+    fsm.set_state(chat_id, "waiting_qty",
+                   slug=slug, ticket_id=ticket_id, session_token="")
+    await notifier.send(chat_id,
+                         "✏️ أرسل عدد التذاكر المطلوب:",
+                         reply_markup=kb.back_to_menu())
+
+
+async def _show_plan(chat_id: str, slug: str, ticket_id: str,
+                      session_token: str, qty: int,
+                      notifier: Notifier) -> None:
     data = await get_event_tickets(slug)
     detail = await get_event_detail(slug)
     ticket = next(
@@ -431,35 +699,49 @@ async def _show_plan(chat_id: str, slug: str, ticket_id: str, qty: int,
                                 max_per_order=ticket["max_per_order"],
                                 min_per_order=ticket["min_per_order"])
     except ValueError as e:
-        txt = (f"⚠️ <b>لا يمكن توزيع {qty} تذاكر</b>\n\n"
-               f"السبب: <code>{e}</code>\n\n"
-               f"الحلول:\n"
-               f"• قلّل العدد\n"
-               f"• أضف حسابات جديدة\n")
-        await notifier.send(chat_id, txt, reply_markup=kb.back_to_menu())
-        return
+        await notifier.send(
+            chat_id,
+            f"⚠️ <b>لا يمكن توزيع {qty} تذاكر</b>\n\n"
+            f"السبب: <code>{e}</code>\n\n"
+            f"الحلول: قلّل العدد أو أضف حسابات.",
+            reply_markup=kb.back_to_menu()); return
+
+    sess = _PICKER_SESSIONS.get(session_token, {})
+    primary = sess.get("primary", "")
+    backups = sess.get("backups", [])
 
     price = ticket.get("display_price") or 0
     total_tickets = meta.get("total_tickets", qty)
     total_amount = price * total_tickets
     ccy = kb._ccy(ticket.get("currency") or "SAR")
     title = (detail or {}).get("title") or slug
+    pay_method = get_bot_setting("DEFAULT_PAYMENT_METHOD",
+                                  default_payment_method())
+    pay_lbl = "💳 بطاقة ائتمانية" if pay_method == "credit_card" else "🍎 Apple Pay"
 
-    # Carry the actual per-account quantity (after clamp) into the booking step
     context_tok = tok.put({
         "slug": slug, "ticket_id": ticket_id,
         "qty": qty,
         "per_account": meta["actual_per_account"],
+        "primary_block": primary,
+        "backup_blocks": backups,
     })
+
+    blocks_line = ""
+    if primary:
+        blocks_line = (f"⭐ الرئيسي: <code>{primary}</code>\n"
+                        f"🔁 الاحتياطية: <code>{' → '.join(backups) or '—'}</code>\n")
 
     txt = (
         f"📊 <b>خطة التوزيع</b>\n\n"
         f"🎭 {title}\n"
         f"🎫 {ticket['title']}\n"
+        f"{blocks_line}"
         f"🔢 لكل حساب: <b>{meta['actual_per_account']}</b> تذكرة\n"
         f"👥 عدد الحسابات: <b>{meta['accounts_count']}</b>\n"
         f"🧮 الإجمالي المتوقع: <b>{total_tickets}</b> تذكرة\n"
-        f"💰 المجموع التقريبي: <b>{kb._fmt_price(total_amount)} {ccy}</b>\n\n"
+        f"💰 المجموع التقريبي: <b>{kb._fmt_price(total_amount)} {ccy}</b>\n"
+        f"💳 طريقة الدفع: <b>{pay_lbl}</b>\n\n"
         f"{describe_plan(plan, accounts, meta)}\n\n"
         f"هل أبدأ الحجز؟"
     )
@@ -468,8 +750,9 @@ async def _show_plan(chat_id: str, slug: str, ticket_id: str, qty: int,
 
 
 async def _execute_booking(chat_id: str, msg_id: int,
-                           slug: str, ticket_id: str, qty: int,
-                           notifier: Notifier) -> None:
+                            slug: str, ticket_id: str, qty: int,
+                            primary_block: str, backup_blocks: list[str],
+                            notifier: Notifier) -> None:
     await notifier.edit(
         chat_id, msg_id,
         "⚡ <b>جارٍ الحجز...</b>\n\n🔄 التحضير...",
@@ -511,6 +794,8 @@ async def _execute_booking(chat_id: str, msg_id: int,
             pass
 
     title = (detail or {}).get("title") or slug
+    pay_method = get_bot_setting("DEFAULT_PAYMENT_METHOD",
+                                  default_payment_method())
 
     results = await book_all(
         plan,
@@ -523,48 +808,60 @@ async def _execute_booking(chat_id: str, msg_id: int,
         chat_id=chat_id, notifier=notifier,
         progress=_progress,
         ticket_meta=ticket,
+        primary_block=primary_block,
+        backup_blocks=backup_blocks,
+        payment_method=pay_method,
     )
 
     succ = [r for r in results if r.get("ok")]
     fail = [r for r in results if not r.get("ok")]
+    watching = [r for r in fail if r.get("drop_watcher_active")]
 
-    lines = [
+    # Per-account summary message + a private DM to each successful account
+    summary_lines = [
         "🎉 <b>انتهى الحجز</b>",
         f"🎭 {title}",
         f"🎫 {ticket['title']}",
         "",
-        f"✅ نجاح: <b>{len(succ)}</b>   ❌ فشل: <b>{len(fail)}</b>",
+        f"✅ نجاح: <b>{len(succ)}</b>   "
+        f"❌ فشل: <b>{len(fail) - len(watching)}</b>   "
+        f"👁️ ترقّب: <b>{len(watching)}</b>",
         "",
     ]
+
     for r in succ:
-        seat = r.get("seat_info") or {}
-        seat_line = ""
-        if seat.get("seats"):
-            seat_line = f"   🪑 المقاعد: {', '.join((seat.get('seats') or [])[:8])}\n"
-        elif seat.get("section") or seat.get("seat_number"):
-            seat_line = (
-                f"   🪑 القسم: {seat.get('section', '—')} · "
-                f"صف: {seat.get('row', '—')} · "
-                f"كرسي: {seat.get('seat_number', '—')}\n"
-            )
-        lines.append(
-            f"✅ <code>{r['label']}</code> — {r['quantity']} تذكرة\n"
-            f"{seat_line}"
-            f"   💳 <a href=\"{r['payment_url']}\">اضغط للدفع</a>"
+        seat_objects = r.get("seat_objects") or []
+        if seat_objects:
+            seats_summary = summarize_for_telegram(seat_objects)
+        else:
+            seats = (r.get("seat_info") or {}).get("seats") or []
+            seats_summary = summarize_for_telegram(seats) if seats else "—"
+
+        block_used = r.get("block_used") or (r.get("seat_info") or {}).get("block", "")
+        block_line = f"\n📦 البلوك المستخدم: <code>{block_used}</code>" if block_used else ""
+
+        summary_lines.append(
+            f"✅ <code>{r['label']}</code> — {r['quantity']} تذكرة"
+            f"{block_line}\n{seats_summary}\n"
+            f"💳 <a href=\"{r['payment_url']}\">رابط الدفع</a>"
         )
+
     for r in fail:
+        if r.get("drop_watcher_active"):
+            continue  # already counted in 'watching'
         lbl = r.get('label') or r.get('account_id')
         err_msg = (r.get('error') or '')[:200]
-        lines.append(f"❌ <code>{lbl}</code>: {err_msg}")
+        summary_lines.append(f"❌ <code>{lbl}</code>: {err_msg}")
+
+    for r in watching:
+        lbl = r.get('label') or r.get('account_id')
+        summary_lines.append(
+            f"👁️ <code>{lbl}</code>: في وضع الترقّب — "
+            f"سيُحجز فور سقوط مقعد."
+        )
 
     if succ:
-        lines.append("\n⏱️ <i>صلاحية روابط الدفع محدودة — سارع!</i>")
-
-    # If ALL bookings failed, offer a manual-fallback link to the event page
-    if not succ and fail:
-        lines.append(
-            f"\n💡 <i>يمكنك فتح الفعالية يدوياً وإكمال الحجز من المتصفح.</i>"
-        )
+        summary_lines.append("\n⏱️ <i>صلاحية روابط الدفع محدودة — سارع!</i>")
 
     keyboard_rows = []
     for r in succ:
@@ -572,14 +869,13 @@ async def _execute_booking(chat_id: str, msg_id: int,
             keyboard_rows.append([
                 {"text": f"💳 دفع {r['label']}", "url": r["payment_url"]}
             ])
-    # Always offer a link to the event's public booking page as a fallback
     keyboard_rows.append([
         {"text": "🌐 فتح صفحة الحجز يدوياً",
          "url": f"https://webook.com/ar/events/{slug}/book"}
     ])
     keyboard_rows.append([{"text": "⬅️ القائمة", "callback_data": "menu"}])
 
-    await notifier.edit(chat_id, msg_id, "\n".join(lines),
+    await notifier.edit(chat_id, msg_id, "\n".join(summary_lines),
                         reply_markup={"inline_keyboard": keyboard_rows})
 
 
@@ -652,7 +948,7 @@ async def _login_flow(chat_id: str, msg_id: int, acc_id: str,
         await notifier.send(
             chat_id,
             f"❌ <b>فشل تسجيل الدخول</b>\n\n"
-            f"السبب: <code>{res.get('error')[:200]}</code>",
+            f"السبب: <code>{(res.get('error') or '')[:200]}</code>",
             reply_markup=kb.accounts_keyboard(list_accounts()),
         )
 
@@ -666,15 +962,18 @@ async def _show_bookings(chat_id: str, notifier: Notifier,
         lines = ["📋 <b>حجوزاتك الأخيرة</b>\n"]
         for b in bks:
             seat = b.get("seat_info") or {}
-            s_str = ""
-            if seat.get("section") or seat.get("seat_number"):
-                s_str = (f" ({seat.get('section', '')} / "
-                         f"كرسي {seat.get('seat_number', '')})")
+            seats = seat.get("seats") or []
+            block = seat.get("block") or ""
+            extra = ""
+            if seats:
+                summary = summarize_for_telegram(seats)
+                extra = f"\n  {summary}"
+            elif block:
+                extra = f"\n  📦 {block}"
             title = (b.get("event_title") or "—")[:40]
             lines.append(
                 f"• <b>{title}</b>\n"
-                f"  {b.get('ticket_type', '')} × {b.get('quantity')}"
-                f"{s_str}\n"
+                f"  {b.get('ticket_type', '')} × {b.get('quantity')}{extra}\n"
                 f"  💳 <a href=\"{b.get('payment_url', '')}\">رابط الدفع</a>"
             )
         txt = "\n".join(lines)
@@ -708,7 +1007,6 @@ def _until(ts: float) -> str:
 # Long-poll fallback
 # ════════════════════════════════════════════════════════════════════════
 async def long_poll_loop(notifier: Notifier) -> None:
-    # Wait for a valid bot token (admin may set it via /admin after boot)
     while not notifier.token:
         log.info("🤖 waiting for TELEGRAM_BOT_TOKEN (set via /admin)…")
         await asyncio.sleep(15)

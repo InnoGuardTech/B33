@@ -1,17 +1,15 @@
 """
 Direct HTTP booking engine — fast path for Webook.
 
-Enhancements in this version:
-  • keeps the old non-seated HTTP flow
-  • adds a real SeatCloud / seats.io reservation layer for seated events
-  • supports prewarmed status snapshots and stalker-mode for released seats
-  • enriches the checkout/cart payload with hold-token + selected seats
+v4 enhancements:
+  • per-event primary + backup block selection (was: global TARGET_BLOCKS)
+  • geometric neighbor expansion when all chosen blocks are full
+  • drop-watcher integration when chart is fully booked
+  • preheld_seats path: skip discovery if drop_watcher already grabbed seats
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 import time
 from typing import Any, Optional
 
@@ -22,13 +20,14 @@ from app.core.config import (
     WEBOOK_ORIGIN,
     WEBOOK_PUBLIC_TOKEN,
     seatsio_enabled,
-    seatsio_stalker_enabled,
-    seatsio_stalker_max_wait,
-    seatsio_stalker_poll_interval,
     target_blocks,
+    default_payment_method,
 )
 from app.services.seatsio_client import SeatsioClient
 from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
+from app.services.block_analyzer import (
+    extract_blocks, find_seats_with_fallback,
+)
 
 log = logging.getLogger("booking_http")
 
@@ -277,39 +276,6 @@ async def create_checkout(
     return False, data or {}
 
 
-async def hold_adjacent_seats(
-    session: aiohttp.ClientSession,
-    *,
-    slug: str,
-    event_id: str,
-    ticket_id: str,
-    quantity: int,
-    time_slot_id: Optional[str],
-    bearer: str,
-) -> tuple[bool, list[str]]:
-    candidates = [
-        ("POST", f"{WEBOOK_API}/seats/hold", {
-            "event_id": event_id, "ticket_id": ticket_id,
-            "quantity": quantity, "time_slot_id": time_slot_id,
-            "selection_mode": "best_available_adjacent",
-        }),
-        ("POST", f"{WEBOOK_API}/event-detail/{slug}/seats/hold", {
-            "ticket_id": ticket_id,
-            "quantity": quantity, "time_slot_id": time_slot_id,
-            "mode": "best_available_adjacent",
-        }),
-    ]
-    for method, url, body in candidates:
-        try:
-            status, data = await _post(session, url, bearer, body, timeout=15)
-            if status == 200 and isinstance(data, dict) and data.get("status") == "success":
-                seats = (data.get("data") or {}).get("seats") or []
-                return True, [str(s) for s in seats]
-        except Exception:
-            continue
-    return False, []
-
-
 async def _reserve_seated_inventory(
     *,
     slug: str,
@@ -317,88 +283,87 @@ async def _reserve_seated_inventory(
     quantity: int,
     bearer: str,
     manifest: dict[str, Any],
-) -> tuple[Optional[dict[str, Any]], list[str]]:
+    primary_block: str = "",
+    backup_blocks: Optional[list[str]] = None,
+) -> tuple[Optional[dict[str, Any]], list[str], dict[str, Any]]:
+    """Reserve seats with the Hydra engine.
+
+    Returns: (seat_payload | None, logs, meta)
+        meta contains: 'block_used', 'rendering_info', 'statuses',
+                       'event_key', 'no_seats_anywhere'
+    """
     logs: list[str] = []
+    meta: dict[str, Any] = {"event_key": manifest.get("event_key") or "",
+                            "block_used": "",
+                            "no_seats_anywhere": False}
     event_key = manifest.get("event_key") or ""
     if not event_key:
-        return None, logs
+        return None, logs, meta
 
-    preferred_blocks = target_blocks()
+    backup_blocks = backup_blocks or []
+    # Legacy ENV-level fallback (lower priority than user-picked blocks)
+    legacy_targets = target_blocks()
+
     await ensure_event_warm(event_key)
     snapshot = get_snapshot(event_key)
 
     async with SeatsioClient(event_key) as client:
-        # First try from warmed snapshot
-        try:
-            if snapshot and snapshot.get("rendering_info"):
-                object_ids, _ = await client.pick_and_hold_adjacent(
-                    quantity,
-                    target_blocks=preferred_blocks,
-                    ticket_type=manifest.get("category") or "",
-                    rendering_info=snapshot.get("rendering_info"),
-                    statuses=snapshot.get("statuses") or {},
-                )
-                if object_ids:
-                    logs.append("🔥 seats prewarmed snapshot hit")
-                    return {
-                        "selected_seats": object_ids,
-                        "selected_seat_labels": object_ids,
-                        "hold_token": client.hold_token,
-                        "seat_hold_token": client.hold_token,
-                        "holdToken": client.hold_token,
-                        "seats_io_category": manifest.get("category") or "",
-                    }, logs
-        except Exception as e:
-            logs.append(f"snapshot miss: {str(e)[:120]}")
+        # Try snapshot first (fastest)
+        rendering_info = (snapshot or {}).get("rendering_info") if snapshot else None
+        statuses = (snapshot or {}).get("statuses") if snapshot else None
+        if rendering_info is None:
+            rendering_info = await client.rendering_info()
+        if statuses is None:
+            statuses = await client.object_statuses()
 
-        # Direct live attempt
+        meta["rendering_info"] = rendering_info
+        meta["statuses"] = statuses
+
+        # Decide block preferences
+        primary = primary_block or (legacy_targets[0] if legacy_targets else "")
+        backups = backup_blocks or legacy_targets[1:]
+
+        seat_ids, used_block = find_seats_with_fallback(
+            rendering_info, statuses,
+            primary_block=primary,
+            backup_blocks=backups,
+            quantity=quantity,
+            expand_geometric=True,
+            expand_limit=8,
+        )
+
+        if not seat_ids:
+            # Detect whether the chart is genuinely full (drop-watcher case)
+            blocks_meta = extract_blocks(rendering_info, statuses)
+            total_free = sum(b.get("free", 0) for b in blocks_meta)
+            meta["no_seats_anywhere"] = (total_free == 0)
+            logs.append(f"🚫 no contiguous {quantity} seats available "
+                        f"(total free in chart: {total_free})")
+            return None, logs, meta
+
+        meta["block_used"] = used_block
         try:
-            object_ids, _ = await client.pick_and_hold_adjacent(
-                quantity,
-                target_blocks=preferred_blocks,
-                ticket_type=manifest.get("category") or "",
+            await client.init_hold_token()
+            hold_result = await client.hold_objects(
+                seat_ids, ticket_type=manifest.get("category") or "",
             )
-            if object_ids:
-                logs.append("🪑 seats held from live SeatCloud")
-                return {
-                    "selected_seats": object_ids,
-                    "selected_seat_labels": object_ids,
-                    "hold_token": client.hold_token,
-                    "seat_hold_token": client.hold_token,
-                    "holdToken": client.hold_token,
-                    "seats_io_category": manifest.get("category") or "",
-                }, logs
+            errors = hold_result.get("errors") if isinstance(hold_result, dict) else None
+            if errors:
+                logs.append(f"hold errors on block={used_block}: {str(errors)[:100]}")
+                return None, logs, meta
         except Exception as e:
-            logs.append(f"live hold fail: {str(e)[:140]}")
+            logs.append(f"hold raise on block={used_block}: {str(e)[:120]}")
+            return None, logs, meta
 
-        # Stalker mode: keep polling for released seats briefly
-        if seatsio_stalker_enabled():
-            deadline = time.time() + max(2.0, seatsio_stalker_max_wait())
-            while time.time() < deadline:
-                try:
-                    statuses = await client.object_statuses()
-                    object_ids, _ = await client.pick_and_hold_adjacent(
-                        quantity,
-                        target_blocks=preferred_blocks,
-                        ticket_type=manifest.get("category") or "",
-                        rendering_info=snapshot.get("rendering_info") if snapshot else None,
-                        statuses=statuses,
-                    )
-                    if object_ids:
-                        logs.append("🎯 stalker mode captured released seats")
-                        return {
-                            "selected_seats": object_ids,
-                            "selected_seat_labels": object_ids,
-                            "hold_token": client.hold_token,
-                            "seat_hold_token": client.hold_token,
-                            "holdToken": client.hold_token,
-                            "seats_io_category": manifest.get("category") or "",
-                        }, logs
-                except Exception:
-                    pass
-                await asyncio.sleep(max(0.15, seatsio_stalker_poll_interval()))
-
-    return None, logs
+        logs.append(f"🪑 held {len(seat_ids)} seats from block={used_block}")
+        return {
+            "selected_seats": seat_ids,
+            "selected_seat_labels": seat_ids,
+            "hold_token": client.hold_token,
+            "seat_hold_token": client.hold_token,
+            "holdToken": client.hold_token,
+            "seats_io_category": manifest.get("category") or "",
+        }, logs, meta
 
 
 async def book_ticket_http(
@@ -407,16 +372,33 @@ async def book_ticket_http(
     slug: str,
     ticket_id: str,
     quantity: int,
-    payment_method: str = "credit_card",
+    payment_method: str = "",
     preferred_date: Optional[str] = None,
     ticket_meta: Optional[dict[str, Any]] = None,
+    primary_block: str = "",
+    backup_blocks: Optional[list[str]] = None,
+    preheld_seats: Optional[list[str]] = None,
+    preheld_token: str = "",
 ) -> dict[str, Any]:
-    result = {
+    """Main HTTP booking entry point.
+
+    New parameters:
+      • primary_block, backup_blocks  → user's seat-picker preferences
+      • preheld_seats, preheld_token  → if drop_watcher already held seats,
+                                         skip the discovery + hold step
+    """
+    payment_method = payment_method or default_payment_method()
+    backup_blocks = backup_blocks or []
+
+    result: dict[str, Any] = {
         "ok": False,
         "payment_url": "",
         "order_id": "",
         "payment_session_id": "",
         "seat_info": {},
+        "seat_objects": [],     # rich objects with category/block/row/seat for summarizer
+        "block_used": "",
+        "no_seats_anywhere": False,
         "logs": [],
         "error": "",
     }
@@ -440,49 +422,68 @@ async def book_ticket_http(
             if time_slot_id:
                 result["logs"].append(f"⏰ time_slot={pick}")
 
-        seat_payload = None
+        seat_payload: Optional[dict[str, Any]] = None
+        rendering_info_for_summary = None
+        statuses_for_summary = None
+
         if meta.get("is_seated") and not meta.get("booking_seats_without_map"):
             manifest = await resolve_seated_manifest(
-                session,
-                slug,
-                ticket_id,
-                bearer,
-                ticket_meta=ticket_meta,
-                event_meta=meta,
+                session, slug, ticket_id, bearer,
+                ticket_meta=ticket_meta, event_meta=meta,
             )
-            if seatsio_enabled() and manifest.get("event_key"):
-                seat_payload, seat_logs = await _reserve_seated_inventory(
+
+            if preheld_seats and preheld_token:
+                # Drop-watcher path: seats already held, just attach to cart/checkout
+                seat_payload = {
+                    "selected_seats": preheld_seats,
+                    "selected_seat_labels": preheld_seats,
+                    "hold_token": preheld_token,
+                    "seat_hold_token": preheld_token,
+                    "holdToken": preheld_token,
+                    "seats_io_category": manifest.get("category") or "",
+                }
+                result["seat_info"] = {
+                    "seats": preheld_seats,
+                    "hold_token": preheld_token,
+                    "category": manifest.get("category") or "",
+                    "event_key": manifest.get("event_key") or "",
+                }
+                result["logs"].append(f"⚡ using {len(preheld_seats)} preheld seats")
+            elif seatsio_enabled() and manifest.get("event_key"):
+                seat_payload, seat_logs, seat_meta = await _reserve_seated_inventory(
                     slug=slug,
                     ticket_id=ticket_id,
                     quantity=quantity,
                     bearer=bearer,
                     manifest=manifest,
+                    primary_block=primary_block,
+                    backup_blocks=backup_blocks,
                 )
                 result["logs"].extend(seat_logs)
+                rendering_info_for_summary = seat_meta.get("rendering_info")
+                statuses_for_summary = seat_meta.get("statuses")
+                result["block_used"] = seat_meta.get("block_used", "")
+                result["no_seats_anywhere"] = bool(seat_meta.get("no_seats_anywhere"))
+
                 if seat_payload:
                     result["seat_info"] = {
                         "seats": seat_payload.get("selected_seats") or [],
                         "hold_token": seat_payload.get("hold_token") or "",
                         "category": manifest.get("category") or "",
                         "event_key": manifest.get("event_key") or "",
+                        "block": result["block_used"],
                     }
                 else:
-                    ok, seats = await hold_adjacent_seats(
-                        session,
-                        slug=slug,
-                        event_id=event_id,
-                        ticket_id=ticket_id,
-                        quantity=quantity,
-                        time_slot_id=time_slot_id,
-                        bearer=bearer,
-                    )
-                    if ok and seats:
-                        seat_payload = {"selected_seats": seats, "selected_seat_labels": seats}
-                        result["seat_info"] = {"seats": seats}
-                        result["logs"].append("🪑 legacy hold endpoint worked")
+                    if result["no_seats_anywhere"]:
+                        result["error"] = "الخريطة ممتلئة بالكامل — يمكنك تفعيل وضع الترقّب"
+                        # caller will register a drop_watcher
+                        result["seat_info"] = {
+                            "event_key": manifest.get("event_key") or "",
+                            "category": manifest.get("category") or "",
+                        }
                     else:
-                        result["error"] = "تعذّر حجز مقاعد seats.io عبر HTTP"
-                        return result
+                        result["error"] = "تعذّر إيجاد مقاعد متجاورة بالعدد المطلوب"
+                    return result
             else:
                 result["logs"].append("⚠️ no SeatCloud event key found — fallback only")
 
@@ -522,6 +523,22 @@ async def book_ticket_http(
         if not pay_url:
             result["error"] = "checkout نجح لكن لم يرجع redirect_url"
             return result
+
+        # Build rich seat_objects for the summarizer
+        if rendering_info_for_summary and seat_payload:
+            try:
+                from app.services.block_analyzer import _walk_objects, _to_int as _to_int_helper
+                wanted = set(seat_payload.get("selected_seats") or [])
+                objs = _walk_objects(rendering_info_for_summary)
+                rich = []
+                for o in objs:
+                    oid = str(o.get("id") or o.get("objectId") or "")
+                    label = o.get("labels", {}).get("displayedLabel") or o.get("label") or oid
+                    if oid in wanted or label in wanted:
+                        rich.append(o)
+                result["seat_objects"] = rich
+            except Exception:
+                pass
 
         result["ok"] = True
         result["payment_url"] = pay_url

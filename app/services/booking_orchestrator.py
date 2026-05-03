@@ -1,8 +1,12 @@
 """
 Parallel booking across multiple accounts.
 
-Primary: HTTP-direct flow with SeatCloud support for seated events.
-Fallback: browser automation only when the HTTP stack cannot complete.
+v4 changes:
+  • per-event primary + backup blocks pass-through
+  • cross-account adjacency: tries to grab one big contiguous run
+    (per_account × accounts_count) inside the SAME block first, then
+    splits cleanly across accounts.
+  • drop_watcher registration when chart is fully booked
 """
 from __future__ import annotations
 
@@ -10,7 +14,10 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
-from app.core.storage import add_booking, get_account, mark_account_used
+from app.core.storage import (
+    add_booking, get_account, mark_account_used, add_drop_watcher,
+)
+from app.core.config import default_payment_method
 from app.services import auth_service
 from app.services.booking_http import book_ticket_http
 from app.services.booking_playwright import book_via_browser
@@ -34,7 +41,13 @@ async def book_one(
     notifier=None,
     progress: Optional[BookingProgressCB] = None,
     ticket_meta: Optional[dict] = None,
+    primary_block: str = "",
+    backup_blocks: Optional[list[str]] = None,
+    payment_method: str = "",
 ) -> dict:
+    backup_blocks = backup_blocks or []
+    payment_method = payment_method or default_payment_method()
+
     acc = get_account(assignment.account_id)
     if not acc:
         return {"ok": False, "account_id": assignment.account_id, "error": "الحساب غير موجود"}
@@ -67,9 +80,38 @@ async def book_one(
         slug=event_slug,
         ticket_id=ticket_id,
         quantity=assignment.quantity,
-        payment_method="credit_card",
+        payment_method=payment_method,
         ticket_meta=ticket_meta,
+        primary_block=primary_block,
+        backup_blocks=backup_blocks,
     )
+
+    # Chart fully booked → register a drop watcher and return early
+    if not res.get("ok") and res.get("no_seats_anywhere"):
+        seat_info = res.get("seat_info") or {}
+        event_key = seat_info.get("event_key", "")
+        if event_key:
+            blocks_pref = ([primary_block] if primary_block else []) + list(backup_blocks)
+            try:
+                add_drop_watcher(
+                    chat_id=str(chat_id),
+                    account_id=assignment.account_id,
+                    event_slug=event_slug,
+                    event_key=event_key,
+                    ticket_type_id=ticket_id,
+                    quantity=assignment.quantity,
+                    blocks_pref=blocks_pref,
+                )
+                await _p(f"👁️ <code>{label}</code> — الخريطة ممتلئة، فُعّل وضع الترقّب")
+            except Exception as e:
+                log.warning(f"add_drop_watcher failed: {e}")
+        return {
+            "ok": False,
+            "account_id": assignment.account_id,
+            "label": label,
+            "error": "الخريطة ممتلئة — فُعّل وضع الترقّب لاصطياد المقاعد الساقطة.",
+            "drop_watcher_active": True,
+        }
 
     if not res.get("ok"):
         first_err = (res.get("error") or "")[:220]
@@ -88,7 +130,9 @@ async def book_one(
                 "ok": True,
                 "payment_url": pw.get("payment_url"),
                 "seat_info": pw.get("seat_info") or {},
+                "seat_objects": pw.get("seat_objects") or [],
                 "order_id": "",
+                "block_used": "",
                 "logs": (res.get("logs") or []) + (pw.get("logs") or []),
             }
         else:
@@ -127,6 +171,8 @@ async def book_one(
         "order_id": res.get("order_id", ""),
         "quantity": assignment.quantity,
         "seat_info": seat_info,
+        "seat_objects": res.get("seat_objects", []),
+        "block_used": res.get("block_used", ""),
         "logs": res.get("logs", []),
     }
 
@@ -145,6 +191,9 @@ async def book_all(
     progress: Optional[BookingProgressCB] = None,
     concurrency: int = 5,
     ticket_meta: Optional[dict] = None,
+    primary_block: str = "",
+    backup_blocks: Optional[list[str]] = None,
+    payment_method: str = "",
 ) -> list[dict]:
     sem = asyncio.Semaphore(max(1, concurrency))
 
@@ -163,6 +212,9 @@ async def book_all(
                     notifier=notifier,
                     progress=progress,
                     ticket_meta=ticket_meta,
+                    primary_block=primary_block,
+                    backup_blocks=backup_blocks or [],
+                    payment_method=payment_method,
                 )
             except Exception as e:
                 log.exception(f"book_one crashed for {a.account_id}: {e}")

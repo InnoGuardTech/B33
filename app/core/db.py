@@ -92,7 +92,7 @@ class _PgCursorWrapper:
     """Wraps psycopg2 cursor and exposes sqlite-like API."""
 
     # Tables with BIGSERIAL 'id' column — only these need lastrowid.
-    _ID_TABLES = {"bookings", "sniper_tasks"}
+    _ID_TABLES = {"bookings", "event_blocks", "drop_watchers"}
 
     def __init__(self, cur, pg_conn, stmt: str):
         self._cur = cur

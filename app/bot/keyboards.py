@@ -13,10 +13,10 @@ from app.bot import tokens as tok
 def main_menu() -> dict[str, Any]:
     return {"inline_keyboard": [
         [{"text": "🎫 الفعاليات الجارية", "callback_data": "events:0"}],
-        [{"text": "🔥 قنّاص سباق الثواني", "callback_data": "sniper:menu"}],
+        [{"text": "🔗 إرسال رابط فعالية", "callback_data": "link:prompt"}],
         [{"text": "👥 إدارة الحسابات", "callback_data": "accounts:list"}],
         [{"text": "📋 حجوزاتي", "callback_data": "bookings:list"}],
-        [{"text": "👁️ كلمات المراقبة", "callback_data": "watch:list"}],
+        [{"text": "⚙️ الإعدادات", "callback_data": "settings:menu"}],
         [{"text": "ℹ️ تعليمات", "callback_data": "help:show"}],
     ]}
 
@@ -30,7 +30,6 @@ def events_keyboard(events: list[dict], page: int = 0,
         t = tok.put({"slug": e["slug"]})
         rows.append([{"text": f"• {_truncate(e['title'] or e['slug'], 50)}",
                       "callback_data": f"evt:{t}"}])
-    # Pagination
     nav = []
     if page > 0:
         nav.append({"text": "◀️ السابق",
@@ -64,7 +63,6 @@ def ticket_types_keyboard(event_slug: str,
         price = t.get("display_price") or 0
         ccy = _ccy(t.get("currency") or "SAR")
         price_lbl = f"{_fmt_price(price)} {ccy}" if price else "—"
-        # ticket_id + slug are too long for callback_data, use token store
         callback_tok = tok.put({"slug": event_slug, "ticket_id": t["id"]})
         label = f"{_truncate(t['title'], 30)} — {price_lbl}{badge}"
         rows.append([{"text": label, "callback_data": f"tck:{callback_tok}"}])
@@ -73,9 +71,45 @@ def ticket_types_keyboard(event_slug: str,
         rows.append([{"text": "⚠️ لا توجد تذاكر متاحة",
                       "callback_data": "menu"}])
 
-    # Back to the events list
     rows.append([{"text": "⬅️ رجوع للفعاليات",
                   "callback_data": "events:0"}])
+    return {"inline_keyboard": rows}
+
+
+def blocks_picker_keyboard(blocks: list[dict], session_token: str,
+                            primary: str = "",
+                            backups: list[str] | None = None,
+                            mode: str = "primary") -> dict[str, Any]:
+    """Block picker for seats.io.
+
+    blocks: [{"name": "S1", "free": 12, "total": 50}, ...]
+    mode:   'primary'  → tap one block to set as PRIMARY
+            'backup'   → tap blocks to add/remove as backup (toggle)
+    """
+    backups = backups or []
+    rows = []
+    for b in blocks[:30]:  # cap to keep callback area sane
+        name = b.get("name", "")
+        free = b.get("free", 0)
+        total = b.get("total", 0)
+        full = "🔴" if free == 0 else ("🟢" if free > 5 else "🟡")
+        marker = ""
+        if name == primary:
+            marker = " ⭐"
+        elif name in backups:
+            marker = f" #{backups.index(name) + 1}"
+        label = f"{full} {name} ({free}/{total}){marker}"
+        rows.append([{"text": label,
+                      "callback_data": f"blk:{mode}:{session_token}:{_safe_block(name)}"}])
+    rows.append([
+        {"text": "⭐ وضع الرئيسي" if mode != "primary" else "✓ وضع الرئيسي",
+         "callback_data": f"blk:setmode:{session_token}:primary"},
+        {"text": "🔁 وضع الاحتياطي" if mode != "backup" else "✓ وضع الاحتياطي",
+         "callback_data": f"blk:setmode:{session_token}:backup"},
+    ])
+    rows.append([{"text": "✅ تأكيد البلوكات والمتابعة",
+                  "callback_data": f"blk:done:{session_token}"}])
+    rows.append([{"text": "⬅️ رجوع", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
 
 
@@ -117,13 +151,16 @@ def account_actions(account_id: str, status: str) -> dict[str, Any]:
     return {"inline_keyboard": rows}
 
 
-def watch_keyboard(keywords: list[str]) -> dict[str, Any]:
-    rows = [[{"text": f"🗑️ {k[:40]}",
-              "callback_data": f"watch:del:{k[:40]}"}]
-            for k in keywords[:20]]
-    rows.append([{"text": "➕ إضافة كلمة", "callback_data": "watch:add"}])
-    rows.append([{"text": "⬅️ رجوع", "callback_data": "menu"}])
-    return {"inline_keyboard": rows}
+def settings_keyboard(current_payment: str = "credit_card") -> dict[str, Any]:
+    cc_mark = " ✓" if current_payment == "credit_card" else ""
+    ap_mark = " ✓" if current_payment == "apple_pay" else ""
+    return {"inline_keyboard": [
+        [{"text": f"💳 بطاقة ائتمانية{cc_mark}",
+          "callback_data": "settings:pay:credit_card"}],
+        [{"text": f"🍎 Apple Pay{ap_mark}",
+          "callback_data": "settings:pay:apple_pay"}],
+        [{"text": "⬅️ رجوع", "callback_data": "menu"}],
+    ]}
 
 
 def back_to_menu() -> dict[str, Any]:
@@ -157,3 +194,8 @@ def _fmt_price(p: float) -> str:
     if p == int(p):
         return str(int(p))
     return f"{p:.2f}"
+
+
+def _safe_block(name: str) -> str:
+    """Sanitize block name for callback_data (avoid colons/spaces)."""
+    return (name or "").replace(":", "_").replace(" ", "_")[:20]
