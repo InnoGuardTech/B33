@@ -79,12 +79,15 @@ def ticket_types_keyboard(event_slug: str,
 def blocks_picker_keyboard(blocks: list[dict], session_token: str,
                             primary: str = "",
                             backups: list[str] | None = None,
-                            mode: str = "primary") -> dict[str, Any]:
+                            mode: str = "primary",
+                            webapp_url: str = "") -> dict[str, Any]:
     """Block picker for seats.io.
 
     blocks: [{"name": "S1", "free": 12, "total": 50}, ...]
+            (free/total may be -1 when unknown via API)
     mode:   'primary'  → tap one block to set as PRIMARY
             'backup'   → tap blocks to add/remove as backup (toggle)
+    webapp_url: optional Telegram WebApp URL for visual seat picking.
     """
     backups = backups or []
     rows = []
@@ -92,13 +95,18 @@ def blocks_picker_keyboard(blocks: list[dict], session_token: str,
         name = b.get("name", "")
         free = b.get("free", 0)
         total = b.get("total", 0)
-        full = "🔴" if free == 0 else ("🟢" if free > 5 else "🟡")
+        if free < 0 or total < 0:
+            full = "⚪"  # unknown availability
+            counts = ""
+        else:
+            full = "🔴" if free == 0 else ("🟢" if free > 5 else "🟡")
+            counts = f" ({free}/{total})"
         marker = ""
         if name == primary:
             marker = " ⭐"
         elif name in backups:
             marker = f" #{backups.index(name) + 1}"
-        label = f"{full} {name} ({free}/{total}){marker}"
+        label = f"{full} {name}{counts}{marker}"
         rows.append([{"text": label,
                       "callback_data": f"blk:{mode}:{session_token}:{_safe_block(name)}"}])
     rows.append([
@@ -107,6 +115,11 @@ def blocks_picker_keyboard(blocks: list[dict], session_token: str,
         {"text": "🔁 وضع الاحتياطي" if mode != "backup" else "✓ وضع الاحتياطي",
          "callback_data": f"blk:setmode:{session_token}:backup"},
     ])
+    if webapp_url:
+        rows.append([{
+            "text": "🌐 الواجهة المرئية (Mini App)",
+            "web_app": {"url": webapp_url},
+        }])
     rows.append([{"text": "✅ تأكيد البلوكات والمتابعة",
                   "callback_data": f"blk:done:{session_token}"}])
     rows.append([{"text": "⬅️ رجوع", "callback_data": "menu"}])

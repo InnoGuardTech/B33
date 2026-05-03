@@ -23,6 +23,7 @@ from app.core.config import (
     telegram_bot_token,
 )
 from app.web.admin import router as admin_router, maybe_rebind_webhook
+from app.web.picker import router as picker_router
 from app.core.logging_setup import setup_logging
 from app.core.db import backend as db_backend, is_persistent as db_is_persistent
 from app.core.storage import (
@@ -121,6 +122,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(admin_router)
+app.include_router(picker_router)
 
 
 # ── HTML dashboard ───────────────────────────────────────────────────────

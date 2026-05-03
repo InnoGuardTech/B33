@@ -22,7 +22,7 @@ from app.bot import keyboards as kb
 from app.bot import state as fsm
 from app.bot import tokens as tok
 from app.bot.notifier import Notifier
-from app.core.config import authorized_chat_ids, default_payment_method
+from app.core.config import authorized_chat_ids, default_payment_method, PUBLIC_URL
 from app.core.storage import (
     delete_account, get_account, list_accounts, list_bookings,
     list_recent_events, upsert_account, upsert_event, set_bot_setting,
@@ -108,6 +108,18 @@ async def _on_message(msg: dict, notifier: Notifier) -> None:
     text = (msg.get("text") or "").strip()
     if not _authorized(chat_id):
         await notifier.send(chat_id, "🚫 غير مصرّح لك باستخدام هذا البوت.")
+        return
+
+    # Handle WebApp Mini Picker payload (sent via Telegram.WebApp.sendData)
+    if "web_app_data" in msg:
+        try:
+            wa = msg["web_app_data"] or {}
+            raw = wa.get("data") or ""
+            import json as _json
+            payload = _json.loads(raw) if raw else {}
+        except Exception:
+            payload = {}
+        await _handle_webapp_selection(chat_id, payload, notifier)
         return
 
     st = fsm.get_state(chat_id)
@@ -320,17 +332,42 @@ async def _route(chat_id: str, msg_id: int, data: str,
 _PICKER_SESSIONS: dict[str, dict] = {}
 
 
+def _webapp_url_for_session(session_token: str) -> str:
+    """Build the public URL for the WebApp Mini Picker for a given session.
+
+    Returns empty string if PUBLIC_URL is not configured (WebApp button
+    will be hidden in that case).
+    """
+    if not PUBLIC_URL:
+        return ""
+    sess = _PICKER_SESSIONS.get(session_token) or {}
+    if not sess.get("event_key"):
+        # Without event_key the visual chart cannot be rendered, so don't
+        # advertise the WebApp button.
+        return ""
+    return f"{PUBLIC_URL.rstrip('/')}/picker/{session_token}"
+
+
 async def _start_block_picker(chat_id: str, msg_id: int,
                                slug: str, ticket_id: str,
                                notifier: Notifier) -> None:
-    """Step 2: fetch event_key + rendering_info → show blocks list."""
+    """Step 2: fetch event_key + rendering_info → show blocks list.
+
+    Strategy (graceful degradation):
+      1. Try seats.io live REST (works for legacy seatcloud charts)
+      2. If that fails (e.g. seats_planner provider behind Turnstile),
+         derive blocks from the ticket categories returned by webook.
+         Each ticket-type IS effectively a block on these new charts.
+      3. Offer a 🌐 WebApp Mini Picker so the user can pick exact seats
+         visually inside Telegram (uses the user's browser → bypasses
+         Turnstile naturally).
+    """
     await notifier.edit(
         chat_id, msg_id,
         "🔄 جارٍ جلب بيانات seats.io للفعالية...",
         reply_markup=None,
     )
 
-    # 1) Get event_key from webook + ticket details
     import aiohttp
     from app.services.booking_http import (
         fetch_event_meta, resolve_seated_manifest,
@@ -338,7 +375,6 @@ async def _start_block_picker(chat_id: str, msg_id: int,
     async with aiohttp.ClientSession() as session:
         meta = await fetch_event_meta(session, slug, "")
         if not meta.get("is_seated"):
-            # No seats.io chart → skip block picker, go straight to qty
             await notifier.edit(
                 chat_id, msg_id,
                 "ℹ️ هذه الفعالية بدون خريطة مقاعد — انتقل لإدخال العدد.",
@@ -349,30 +385,48 @@ async def _start_block_picker(chat_id: str, msg_id: int,
         manifest = await resolve_seated_manifest(
             session, slug, ticket_id, "", event_meta=meta,
         )
+        # Also pull tickets for category-fallback
+        tickets_data = await get_event_tickets(slug)
 
     event_key = manifest.get("event_key") or ""
-    if not event_key:
-        await notifier.edit(
-            chat_id, msg_id,
-            "⚠️ تعذّر استخراج مفتاح seats.io للفعالية.\n"
-            "جرّب من المتصفح يدوياً.",
-            reply_markup=kb.back_to_menu(),
-        ); return
+    raw_event = (meta.get("raw") or {})
+    seats_io_blob = raw_event.get("seats_io") or {}
+    seats_provider = raw_event.get("seats_provider") or ""
 
-    # 2) Get rendering_info + statuses
-    try:
-        await ensure_event_warm(event_key)
-        async with SeatsioClient(event_key) as client:
-            rendering_info = await client.rendering_info()
-            statuses = await client.object_statuses()
-    except Exception as e:
-        await notifier.edit(
-            chat_id, msg_id,
-            f"⚠️ فشل الاتصال بـ seats.io: <code>{str(e)[:120]}</code>",
-            reply_markup=kb.back_to_menu(),
-        ); return
+    # 1) Try live seats.io rendering_info
+    rendering_info = None
+    statuses = {}
+    blocks_meta: list[dict] = []
+    if event_key:
+        try:
+            await ensure_event_warm(event_key)
+            async with SeatsioClient(event_key) as client:
+                rendering_info = await client.rendering_info()
+                statuses = await client.object_statuses()
+            blocks_meta = extract_blocks(rendering_info, statuses)
+        except Exception as e:
+            log.debug(f"seats.io rendering_info failed: {e}")
 
-    blocks_meta = extract_blocks(rendering_info, statuses)
+    # 2) Fallback: derive blocks from ticket categories
+    fallback_used = False
+    if not blocks_meta:
+        active_tickets = [
+            t for t in (tickets_data.get("tickets") or [])
+            if t.get("status") == "active" and t.get("sale_status") == "ongoing"
+        ]
+        if active_tickets:
+            blocks_meta = []
+            for t in active_tickets:
+                cat = t.get("seats_io_category") or ""
+                blocks_meta.append({
+                    "name": t.get("title") or f"cat-{cat}",
+                    "free": -1,           # unknown via API
+                    "total": -1,
+                    "category": str(cat),
+                    "ticket_id": t.get("id"),
+                })
+            fallback_used = True
+
     if not blocks_meta:
         await notifier.edit(
             chat_id, msg_id,
@@ -381,44 +435,59 @@ async def _start_block_picker(chat_id: str, msg_id: int,
             reply_markup=kb.back_to_menu(),
         ); return
 
-    # Cache the seat map for reuse
-    try:
-        from app.core.storage import save_seat_map
-        save_seat_map(
-            chart_key=event_key, event_key=event_key,
-            rendering_info=rendering_info,
-            blocks_meta=[{"name": b["name"], "free": b["free"],
-                          "total": b["total"]} for b in blocks_meta],
-        )
-    except Exception:
-        pass
+    # Cache the seat map for reuse (only if real)
+    if rendering_info and not fallback_used:
+        try:
+            from app.core.storage import save_seat_map
+            save_seat_map(
+                chart_key=event_key, event_key=event_key,
+                rendering_info=rendering_info,
+                blocks_meta=[{"name": b["name"], "free": b["free"],
+                              "total": b["total"]} for b in blocks_meta],
+            )
+        except Exception:
+            pass
 
     session_token = uuid.uuid4().hex[:10]
     _PICKER_SESSIONS[session_token] = {
+        "chat_id": chat_id,
         "slug": slug,
         "ticket_id": ticket_id,
         "event_key": event_key,
+        "workspace_key": seats_io_blob.get("workspace_key") or "",
+        "chart_key": seats_io_blob.get("chart_key") or "",
+        "seats_provider": seats_provider,
         "blocks_meta": blocks_meta,
         "primary": "",
         "backups": [],
         "mode": "primary",
+        "fallback_used": fallback_used,
+        "webapp_completed": False,
+        "created_at": time.time(),
     }
 
-    free_total = sum(b["free"] for b in blocks_meta)
+    if fallback_used:
+        free_line = "📊 البلوكات (من أنواع التذاكر):"
+    else:
+        free_total = sum(b.get("free", 0) for b in blocks_meta if b.get("free", 0) >= 0)
+        free_line = f"🟢 مقاعد متاحة الآن: <b>{free_total}</b>"
+
     txt = (
         f"🗺️ <b>اختر البلوكات</b>\n\n"
-        f"📊 إجمالي البلوكات: <b>{len(blocks_meta)}</b>\n"
-        f"🟢 مقاعد متاحة الآن: <b>{free_total}</b>\n\n"
-        f"1️⃣ اضغط على بلوك ليصبح <b>الرئيسي ⭐</b>\n"
+        f"📦 إجمالي البلوكات: <b>{len(blocks_meta)}</b>\n"
+        f"{free_line}\n"
+        + ("⚠️ <i>الفعالية محمية بـ Turnstile — يستحسن استخدام «الواجهة المرئية» أدناه لاختيار مقاعد مرئية.</i>\n" if fallback_used else "")
+        + f"\n1️⃣ اضغط على بلوك ليصبح <b>الرئيسي ⭐</b>\n"
         f"2️⃣ بدّل لـ «وضع الاحتياطي» وأضف S2, S3...\n"
-        f"3️⃣ اضغط <b>تأكيد البلوكات</b> للمتابعة"
+        f"3️⃣ اضغط <b>تأكيد البلوكات</b> للمتابعة\n"
+        f"   أو <b>🌐 الواجهة المرئية</b> لاختيار من الخريطة الفعلية"
     )
     await notifier.edit(
         chat_id, msg_id, txt,
         reply_markup=kb.blocks_picker_keyboard(
             blocks_meta, session_token, primary="", backups=[],
             mode="primary",
-        ),
+        webapp_url=_webapp_url_for_session(session_token)),
     )
 
 
@@ -444,10 +513,10 @@ async def _route_blocks(chat_id: str, msg_id: int, data: str,
             chat_id, msg_id,
             _build_picker_caption(sess),
             reply_markup=kb.blocks_picker_keyboard(
-                blocks_meta, sess_tok,
+            blocks_meta, sess_tok,
                 primary=sess["primary"], backups=sess["backups"],
                 mode=sess["mode"],
-            ),
+            webapp_url=_webapp_url_for_session(sess_tok)),
         ); return
 
     if op in ("primary", "backup"):
@@ -476,10 +545,10 @@ async def _route_blocks(chat_id: str, msg_id: int, data: str,
             chat_id, msg_id,
             _build_picker_caption(sess),
             reply_markup=kb.blocks_picker_keyboard(
-                blocks_meta, sess_tok,
+            blocks_meta, sess_tok,
                 primary=sess["primary"], backups=sess["backups"],
                 mode=sess["mode"],
-            ),
+            webapp_url=_webapp_url_for_session(sess_tok)),
         ); return
 
     if op == "done":
@@ -489,10 +558,10 @@ async def _route_blocks(chat_id: str, msg_id: int, data: str,
                 "⚠️ <b>اختر البلوك الرئيسي أولاً</b>\n\n"
                 "تأكد أن أحد البلوكات معلّم بـ ⭐",
                 reply_markup=kb.blocks_picker_keyboard(
-                    blocks_meta, sess_tok,
+            blocks_meta, sess_tok,
                     primary=sess["primary"], backups=sess["backups"],
                     mode=sess["mode"],
-                ),
+                webapp_url=_webapp_url_for_session(sess_tok)),
             ); return
         # → ask quantity
         await _ask_quantity(chat_id, msg_id, sess["slug"], sess["ticket_id"],
@@ -612,6 +681,85 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
         await notifier.edit(chat_id, edit_msg_id, txt, reply_markup=rkb)
     else:
         await notifier.send(chat_id, txt, reply_markup=rkb)
+
+
+async def _handle_webapp_selection(chat_id: str, payload: dict,
+                                     notifier: Notifier) -> None:
+    """Apply a WebApp Mini Picker selection to the most recent picker
+    session for this chat.
+
+    Telegram doesn't tell us which session token the WebApp came from
+    (sendData carries only the JSON), so we use the most recent session
+    that has no completed selection yet.
+    """
+    if not payload:
+        await notifier.send(chat_id, "⚠️ لم أستلم بيانات اختيار صالحة من الواجهة.",
+                              reply_markup=kb.back_to_menu())
+        return
+
+    primary = (payload.get("primary") or "").strip()
+    backups_raw = payload.get("backups") or []
+    backups = [str(b).strip() for b in backups_raw if str(b).strip()]
+    seats = [s for s in (payload.get("seats") or []) if s]
+
+    if not primary and not seats:
+        await notifier.send(chat_id,
+            "⚠️ لم تختر أي بلوك أو مقعد. أعد المحاولة.",
+            reply_markup=kb.back_to_menu())
+        return
+
+    # Find the most recent picker session for this chat
+    target_token = None
+    target_sess = None
+    for tok_, s in reversed(list(_PICKER_SESSIONS.items())):
+        if s.get("chat_id") == chat_id and not s.get("webapp_completed"):
+            target_token = tok_
+            target_sess = s
+            break
+    if not target_sess:
+        # Fallback: take the latest one regardless
+        if _PICKER_SESSIONS:
+            target_token = list(_PICKER_SESSIONS.keys())[-1]
+            target_sess = _PICKER_SESSIONS[target_token]
+
+    if not target_sess:
+        await notifier.send(chat_id,
+            "⚠️ انتهت جلسة اختيار البلوكات. ابدأ من جديد.",
+            reply_markup=kb.main_menu())
+        return
+
+    if primary:
+        target_sess["primary"] = primary
+    if backups:
+        seen = set([target_sess["primary"]] if target_sess.get("primary") else [])
+        target_sess["backups"] = []
+        for b in backups:
+            if b in seen:
+                continue
+            seen.add(b)
+            target_sess["backups"].append(b)
+    if seats:
+        target_sess["preselected_seats"] = seats
+    target_sess["webapp_completed"] = True
+
+    primary_show = target_sess.get("primary") or "—"
+    backups_show = " → ".join(target_sess.get("backups") or []) or "—"
+    seat_count = len(target_sess.get("preselected_seats") or [])
+    seat_line = f"\n🪑 مقاعد مختارة مسبقاً: <b>{seat_count}</b>" if seat_count else ""
+
+    await notifier.send(
+        chat_id,
+        f"✅ <b>تم استلام اختيارك من الواجهة المرئية</b>\n\n"
+        f"⭐ الرئيسي: <code>{primary_show}</code>\n"
+        f"🔁 الاحتياطية: <code>{backups_show}</code>"
+        f"{seat_line}\n\n"
+        f"✨ أرسل الآن عدد التذاكر المطلوب لكل حساب.",
+        reply_markup=kb.back_to_menu(),
+    )
+    fsm.set_state(chat_id, "waiting_qty",
+                   slug=target_sess["slug"],
+                   ticket_id=target_sess["ticket_id"],
+                   session_token=target_token)
 
 
 async def _ask_quantity(chat_id: str, msg_id: int, slug: str, ticket_id: str,
