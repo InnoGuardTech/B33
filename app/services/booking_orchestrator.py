@@ -54,12 +54,27 @@ def _is_chart_truly_full(res: dict) -> bool:
     return bool(res.get("chart_full"))
 
 
+def _is_account_limit(res: dict) -> bool:
+    """Return True when webook rejected the booking due to per-account
+    ticket-limit / subscription cap. Such an account must be skipped —
+    NEVER retried (would just keep failing) and NEVER watched.
+    """
+    if res.get("account_limit_reached"):
+        return True
+    err = (res.get("error") or "").lower()
+    return ("limit reached" in err or "حد التذاكر" in err
+            or "تجاوزت حد" in err
+            or "booking limit" in err)
+
+
 def _is_transient_failure(res: dict) -> bool:
     """Return True for failures that should be retried, NOT watched."""
     if res.get("ok"):
         return False
     if _is_chart_truly_full(res):
         return False  # canonical watcher case
+    if _is_account_limit(res):
+        return False  # NEVER retry an account-limit failure — it's permanent
     # Explicit transient signals
     if res.get("turnstile_required"):
         return True
@@ -72,7 +87,7 @@ def _is_transient_failure(res: dict) -> bool:
     transient_hints = (
         "timeout", "timed out", "network", "connection", "temporarily",
         "captcha", "turnstile", "queue", "rate limit", "429", "503", "502",
-        "504", "reset", "broken", "unavailable",
+        "504", "reset", "broken", "unavailable", "cloudflare",
     )
     if any(h in err for h in transient_hints):
         return True
@@ -80,6 +95,8 @@ def _is_transient_failure(res: dict) -> bool:
 
 
 def _failure_kind(res: dict) -> str:
+    if _is_account_limit(res):
+        return "account_limit"
     if res.get("chart_full"):
         return "chart_full"
     if res.get("turnstile_required"):

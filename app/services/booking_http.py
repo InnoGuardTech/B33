@@ -257,11 +257,18 @@ async def add_to_cart(
     if time_slot_id:
         body["time_slot_id"] = time_slot_id
     if seat_payload:
-        body.update({k: v for k, v in seat_payload.items() if v not in (None, "", [], {})})
+        # Same v7 fix as create_checkout: drop empty strings + alias dupes.
+        clean = {k: v for k, v in seat_payload.items()
+                  if v not in (None, "", [], {})}
+        clean.pop("holdToken", None)
+        clean.pop("seat_hold_token", None)
+        body.update(clean)
 
     status, data = await _post(session, f"{WEBOOK_API}/cart/add-to-cart?lang=en", bearer, body)
     if status == 200 and isinstance(data, dict) and data.get("status") == "success":
         return True, data.get("data") or {}
+    # v7: surface webook's structured 'errors' dict (e.g. ticket-limit) to
+    # the caller so book_one can classify it correctly.
     return False, data
 
 
@@ -309,7 +316,18 @@ async def create_checkout(
     if time_slot_id:
         body["time_slot_id"] = time_slot_id
     if seat_payload:
-        body.update({k: v for k, v in seat_payload.items() if v not in (None, "", [], {})})
+        # CRITICAL v7 fix: filter empty strings/lists/dicts. The field
+        # seats_io_category="" specifically triggers Cloudflare WAF 403
+        # on /checkout. Also de-duplicate hold_token aliases — webook
+        # only needs `hold_token` (snake_case); the camelCase aliases
+        # (`holdToken`, `seat_hold_token`) are redundant and increase
+        # the body fingerprint risk.
+        clean = {k: v for k, v in seat_payload.items()
+                  if v not in (None, "", [], {})}
+        # Drop redundant aliases
+        clean.pop("holdToken", None)
+        clean.pop("seat_hold_token", None)
+        body.update(clean)
 
     status, data = await _post(session, f"{WEBOOK_API}/event-detail/{slug}/checkout?lang=en", bearer, body, timeout=30)
     if status == 200 and isinstance(data, dict) and data.get("status") == "success":
@@ -638,8 +656,26 @@ async def book_ticket_http(
             seat_payload=seat_payload,
         )
         if not ok:
-            msg = (cart_data.get("message") or cart_data.get("error") or str(cart_data))[:300]
-            result["error"] = f"فشل add-to-cart: {msg}"
+            # v7: detect 'ticket limit reached' (per-account subscription cap).
+            # webook returns it as data.errors[<id>].message containing 'limit reached'
+            errors_blob = (cart_data or {}).get("data", {}).get("errors") if isinstance(cart_data, dict) else None
+            if not errors_blob and isinstance(cart_data, dict):
+                errors_blob = cart_data.get("errors")
+            limit_msg = ""
+            if isinstance(errors_blob, dict):
+                for v in errors_blob.values():
+                    if isinstance(v, dict) and "limit reached" in (v.get("message") or "").lower():
+                        limit_msg = v.get("message") or ""
+                        break
+            msg = limit_msg or (cart_data.get("message") or cart_data.get("error") or str(cart_data))[:300]
+            if limit_msg:
+                result["account_limit_reached"] = True
+                result["error"] = (
+                    f"تم بلوغ الحد المسموح للحساب: {limit_msg}. "
+                    "جرّب حساباً آخر."
+                )
+            else:
+                result["error"] = f"فشل add-to-cart: {msg}"
             return result
         result["logs"].append(f"🛒 cart ok ({cart_data.get('item_quantity', quantity)} tickets)")
 
@@ -655,8 +691,26 @@ async def book_ticket_http(
             seat_payload=seat_payload,
         )
         if not ok:
-            msg = (co_data.get("message") or co_data.get("error") or str(co_data))[:350]
-            result["error"] = f"فشل checkout: {msg}"
+            raw_body = co_data if isinstance(co_data, dict) else {}
+            msg = (raw_body.get("message") or raw_body.get("error") or str(co_data))[:350]
+            # v7: 'sold out' from webook for a seat we just got cart_ok for is
+            # almost always due to per-account ticket limit (not real sell-out)
+            msg_lower = str(msg).lower()
+            if "sold out" in msg_lower or "already sold" in msg_lower:
+                result["account_limit_reached"] = True
+                result["error"] = (
+                    "تم رفض الحجز من Webook (غالباً تجاوزت حد التذاكر للحساب أو "
+                    "المقعد المحدد لم يعد متاحاً). جرّب حساباً آخر."
+                )
+            elif "limit reached" in msg_lower:
+                result["account_limit_reached"] = True
+                result["error"] = f"تم بلوغ حد التذاكر للحساب: {msg}"
+            elif "raw" in raw_body and raw_body.get("raw") == "-":
+                # Cloudflare 403 — transient, will be retried by orchestrator
+                result["chart_unreachable"] = True
+                result["error"] = "حُجبت من Cloudflare (سيُعاد المحاولة تلقائياً)."
+            else:
+                result["error"] = f"فشل checkout: {msg}"
             return result
 
         pay_url = co_data.get("redirect_url") or (co_data.get("response") or {}).get("redirect_url")

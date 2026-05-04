@@ -399,7 +399,9 @@ def find_seats_with_fallback(rendering_info: Any,
       1. primary_block
       2. backup_blocks (in user order)
       3. geometric neighbors (same category preferred) — only if
-         expand_geometric=True
+         expand_geometric=True AND we have at least one ref block
+      4. AUTO-PICK: any free block on the chart, sorted by capacity desc
+         (used when the user did NOT choose any block at all)
     """
     if primary_block:
         ids = adjacent_seats_in_block(rendering_info, statuses,
@@ -433,6 +435,24 @@ def find_seats_with_fallback(rendering_info: Any,
                 if ids:
                     return ids, nb
                 seen.add(nb)
+
+    # ──── AUTO-PICK FALLBACK (v7): the user didn't choose any block, OR ────
+    # ──── their chosen blocks plus all geometric neighbors are full.   ────
+    # Try EVERY free block on the chart, sorted by descending free capacity
+    # so we prefer the spaces with the most availability (faster checkout).
+    candidate_blocks = sorted(
+        [b for b in blocks if b.get("name") and b.get("name") not in seen
+         and b.get("is_available_for_sale") is not False
+         and ((b.get("free") or 0) >= quantity
+              or (b.get("free") or 0) < 0)],   # -1 = unknown, treat as available
+        key=lambda b: -(b.get("free") or 0),
+    )
+    for b in candidate_blocks:
+        nb = b.get("name")
+        ids = adjacent_seats_in_block(rendering_info, statuses, nb, quantity)
+        if ids:
+            return ids, nb
+        seen.add(nb)
 
     return [], ""
 
