@@ -115,27 +115,13 @@ async def _read_json(resp: aiohttp.ClientResponse) -> Any:
 # ════════════════════════════════════════════════════════════════════════
 # Webook hold-token source (preferred for seats_planner events)
 # ════════════════════════════════════════════════════════════════════════
-async def get_hold_token_from_webook(
-    *,
-    slug: str,
-    event_id: str,
-    bearer: str,
-    turnstile: str = "",
-    time_slot_id: str = "",
+async def _post_hold_token_once(
+    *, slug: str, event_id: str, bearer: str,
+    turnstile: str, time_slot_id: str,
 ) -> tuple[Optional[str], dict]:
-    """Request a hold-token from webook.
-
-    Returns (token, meta) where meta carries:
-      - 'queued': bool, 'waiting_number': int, 'total_in_queue': int  (queue state)
-      - 'turnstile_required': bool
-      - 'errors': dict (validation errors)
-      - 'http_status': int
-    """
+    """Single attempt at /hold-token without auto-solving turnstile."""
     meta: dict[str, Any] = {"queued": False, "turnstile_required": False,
                              "http_status": 0}
-    if not bearer or not slug or not event_id:
-        return None, meta
-
     url = f"{WEBOOK_API}/event-detail/{slug}/hold-token?lang=en"
     body: dict[str, Any] = {"event_id": event_id, "lang": "en"}
     if turnstile:
@@ -152,7 +138,6 @@ async def get_hold_token_from_webook(
         "referer": f"{WEBOOK_ORIGIN}/",
         "authorization": f"Bearer {bearer}",
     }
-    # Pull the public token lazily to avoid import cycles
     try:
         from app.core.config import webook_public_token
         headers["token"] = webook_public_token()
@@ -168,12 +153,10 @@ async def get_hold_token_from_webook(
                 meta["http_status"] = r.status
                 d = await _read_json(r) or {}
 
-        # 422 turnstile
         if isinstance(d, dict) and d.get("errors", {}).get("turnstile"):
             meta["turnstile_required"] = True
             meta["errors"] = d.get("errors")
             return None, meta
-
         if not isinstance(d, dict):
             return None, meta
 
@@ -186,16 +169,90 @@ async def get_hold_token_from_webook(
         token = (d.get("data") or {}).get("token") or d.get("token")
         if isinstance(token, str) and token:
             return token, meta
-        # Some responses bury the token deeper
-        if isinstance(d, dict):
-            for key in ("hold_token", "holdToken", "seat_hold_token"):
-                v = d.get(key) or (d.get("data") or {}).get(key)
-                if isinstance(v, str) and v:
-                    return v, meta
+        for key in ("hold_token", "holdToken", "seat_hold_token"):
+            v = d.get(key) or (d.get("data") or {}).get(key)
+            if isinstance(v, str) and v:
+                return v, meta
         return None, meta
     except Exception as e:
         log.debug(f"webook hold-token error: {e}")
         return None, meta
+
+
+async def get_hold_token_from_webook(
+    *,
+    slug: str,
+    event_id: str,
+    bearer: str,
+    turnstile: str = "",
+    time_slot_id: str = "",
+    auto_solve_turnstile: bool = True,
+) -> tuple[Optional[str], dict]:
+    """Request a hold-token from webook with automatic Turnstile bypass.
+
+    On 422 errors.turnstile response, automatically solves Turnstile via
+    2Captcha (or Playwright fallback) and retries up to 2 times. The
+    user is never prompted to open a browser.
+
+    Returns (token, meta) where meta carries:
+      - 'queued': bool, 'waiting_number': int, 'total_in_queue': int
+      - 'turnstile_required': bool, 'turnstile_solved': bool
+      - 'errors': dict (validation errors)
+      - 'http_status': int
+    """
+    if not bearer or not slug or not event_id:
+        return None, {"queued": False, "turnstile_required": False,
+                       "http_status": 0}
+
+    # First attempt — with whatever turnstile token we already have (may be empty)
+    token, meta = await _post_hold_token_once(
+        slug=slug, event_id=event_id, bearer=bearer,
+        turnstile=turnstile, time_slot_id=time_slot_id,
+    )
+    if token:
+        return token, meta
+
+    # If turnstile is required and we're allowed to auto-solve, try up to 2 times
+    if not (meta.get("turnstile_required") and auto_solve_turnstile):
+        return None, meta
+
+    try:
+        from app.services.turnstile_solver import solve_turnstile, invalidate_cache
+    except Exception as e:
+        log.warning(f"turnstile_solver unavailable: {e}")
+        return None, meta
+
+    page_url = f"{WEBOOK_ORIGIN}/ar/sa/bur/sports-event/events/{slug}"
+    for attempt in (1, 2):
+        log.info(f"🛡️  auto-solving Turnstile (attempt {attempt}/2) for {slug}")
+        ts_token = await solve_turnstile(
+            page_url, force_refresh=(attempt == 2),
+        )
+        if not ts_token:
+            log.warning("turnstile solver returned empty token")
+            continue
+        meta["turnstile_solved"] = True
+        token, retry_meta = await _post_hold_token_once(
+            slug=slug, event_id=event_id, bearer=bearer,
+            turnstile=ts_token, time_slot_id=time_slot_id,
+        )
+        # Merge retry meta forward
+        meta["http_status"] = retry_meta.get("http_status", meta["http_status"])
+        if retry_meta.get("queued"):
+            meta["queued"] = True
+            meta["waiting_number"] = retry_meta.get("waiting_number")
+            meta["total_in_queue"] = retry_meta.get("total_in_queue")
+        if token:
+            meta["turnstile_required"] = False
+            log.info(f"✅ hold-token acquired after Turnstile bypass")
+            return token, meta
+        if not retry_meta.get("turnstile_required"):
+            # Non-turnstile error — abort retry loop
+            return None, retry_meta
+        # Else: token rejected, force-refresh and try once more
+        invalidate_cache(page_url)
+
+    return None, meta
 
 
 # ════════════════════════════════════════════════════════════════════════

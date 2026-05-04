@@ -236,28 +236,30 @@ async def _capture_one(client: SeatsioClient, watcher: dict,
     if not seat_ids:
         return  # still nothing free → keep watching
 
-    # Hold the seats immediately
+    # Hold the seats immediately (best-effort — seats_planner doesn't need it)
     try:
         await client.init_hold_token()
         hold_result = await client.hold_objects(seat_ids)
         errors = hold_result.get("errors") if isinstance(hold_result, dict) else None
         if errors:
-            log.debug(f"watcher#{watcher['id']} hold errors: {errors}")
-            return
+            log.debug(f"watcher#{watcher['id']} hold errors (non-fatal): {errors}")
     except Exception as e:
-        log.debug(f"watcher#{watcher['id']} hold raise: {e}")
-        return
+        log.debug(f"watcher#{watcher['id']} hold raise (non-fatal): {e}")
 
-    # Now finalize the booking via the HTTP path
+    # Now finalize the booking via the HTTP path (Turnstile auto-solved
+    # internally when needed by booking_http → get_hold_token_from_webook).
     try:
         from app.services.booking_http import book_ticket_http
         from app.services import auth_service
 
         bearer = await auth_service.get_valid_bearer(
-            watcher["account_id"], notifier=notifier, auto_relogin=False,
+            watcher["account_id"], notifier=notifier, auto_relogin=True,
         )
         if not bearer:
-            await client.release_objects(seat_ids)
+            try:
+                await client.release_objects(seat_ids)
+            except Exception:
+                pass
             return
 
         res = await book_ticket_http(
@@ -274,7 +276,6 @@ async def _capture_one(client: SeatsioClient, watcher: dict,
         return
 
     if not res.get("ok"):
-        # Release and keep watching
         try:
             await client.release_objects(seat_ids)
         except Exception:

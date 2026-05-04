@@ -949,6 +949,43 @@ async def _execute_booking(chat_id: str, msg_id: int,
     pay_method = get_bot_setting("DEFAULT_PAYMENT_METHOD",
                                   default_payment_method())
 
+    # Fast-Lane callback — fires the moment the FIRST account succeeds.
+    # The user gets the PayTabs URL instantly without waiting for the rest.
+    fast_sent: dict[str, bool] = {}
+
+    async def _fast_callback(r: dict) -> None:
+        if not r.get("ok") or not r.get("payment_url"):
+            return
+        if fast_sent.get(r["account_id"]):
+            return
+        fast_sent[r["account_id"]] = True
+        try:
+            seat_objects = r.get("seat_objects") or []
+            seats = (r.get("seat_info") or {}).get("seats") or []
+            seats_summary = (
+                summarize_for_telegram(seat_objects) if seat_objects
+                else summarize_for_telegram(seats) if seats else "—"
+            )
+            block_used = r.get("block_used") or (r.get("seat_info") or {}).get("block", "")
+            block_line = f"\n📦 البلوك: <code>{block_used}</code>" if block_used else ""
+            msg = (
+                f"⚡️ <b>رابط الدفع جاهز!</b>\n\n"
+                f"🎭 {title}\n"
+                f"🎫 {ticket['title']} × {r['quantity']}\n"
+                f"👤 <code>{r['label']}</code>{block_line}\n"
+                f"{seats_summary}\n\n"
+                f"💳 <a href=\"{r['payment_url']}\">افتح رابط الدفع</a>\n\n"
+                f"⏱️ <i>الرابط صالح لبضع دقائق فقط.</i>"
+            )
+            kb_rows = [[
+                {"text": f"💳 دفع {r['label']}",
+                 "url": r["payment_url"]}
+            ]]
+            await notifier.send(chat_id, msg,
+                                reply_markup={"inline_keyboard": kb_rows})
+        except Exception as e:
+            log.warning(f"fast_callback send err: {e}")
+
     results = await book_all(
         plan,
         event_slug=slug,
@@ -959,6 +996,7 @@ async def _execute_booking(chat_id: str, msg_id: int,
         currency=ticket["currency"],
         chat_id=chat_id, notifier=notifier,
         progress=_progress,
+        fast_callback=_fast_callback,
         ticket_meta=ticket,
         primary_block=primary_block,
         backup_blocks=backup_blocks,
