@@ -51,7 +51,12 @@ _LAST_STATUSES: dict[str, dict[str, str]] = {}
 
 async def drop_watcher_loop(notifier=None) -> None:
     """Top-level supervisor. Every 15s, reconciles WS subscriptions
-    against the active watchers in DB."""
+    against the active watchers in DB.
+
+    v6 fix: also runs Pre-Watch Sanity Check on every fresh watcher —
+    if seats are already free, the watcher is bypassed and the booking
+    is fired through the fast-lane immediately.
+    """
     if not seatsio_drop_watcher_enabled():
         log.info("drop watcher disabled by config")
         return
@@ -59,6 +64,8 @@ async def drop_watcher_loop(notifier=None) -> None:
     while True:
         try:
             await _reconcile(notifier)
+            # v6: opportunistic capture for any watcher whose seats are now free
+            await _opportunistic_capture(notifier)
         except asyncio.CancelledError:
             for t in _WS_TASKS.values():
                 t.cancel()
@@ -66,6 +73,59 @@ async def drop_watcher_loop(notifier=None) -> None:
         except Exception as e:
             log.exception(f"drop_watcher reconcile error: {e}")
         await asyncio.sleep(15)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# PRE-WATCH SANITY CHECK (v6)
+# ════════════════════════════════════════════════════════════════════════
+async def _opportunistic_capture(notifier) -> None:
+    """For every active watcher, do a fast HTTP probe of the chart. If
+    seats are already free for that watcher's preferences, fire the
+    capture path immediately — do NOT wait for a WS drop event that may
+    never come (seats were free all along).
+    """
+    watchers = list_drop_watchers(status="watching")
+    if not watchers:
+        return
+
+    # Group by event_key to share one SeatsioClient probe per chart
+    by_event: dict[str, list[dict]] = {}
+    for w in watchers:
+        ek = w.get("event_key") or ""
+        if ek:
+            by_event.setdefault(ek, []).append(w)
+
+    for event_key, ws_list in by_event.items():
+        try:
+            async with SeatsioClient(event_key) as client:
+                ri = await client.rendering_info()
+                statuses = await client.object_statuses()
+                if not ri or not (ri.get("objects") or []):
+                    continue
+                _LAST_STATUSES[event_key] = statuses
+
+                for w in ws_list:
+                    primary = (w.get("blocks_pref") or [None])[0] or ""
+                    backups = (w.get("blocks_pref") or [])[1:]
+                    qty = int(w.get("quantity") or 1)
+                    seat_ids, used_block = find_seats_with_fallback(
+                        ri, statuses,
+                        primary_block=primary, backup_blocks=backups,
+                        quantity=qty, expand_geometric=True,
+                    )
+                    if seat_ids:
+                        log.info(
+                            f"🎯 watcher#{w['id']} — seats already free, "
+                            f"firing immediate capture (block={used_block})"
+                        )
+                        try:
+                            await _capture_one(
+                                client, w, ri, statuses, notifier,
+                            )
+                        except Exception as e:
+                            log.debug(f"opportunistic capture err: {e}")
+        except Exception as e:
+            log.debug(f"opportunistic probe err for {event_key[:8]}: {e}")
 
 
 async def _reconcile(notifier) -> None:
