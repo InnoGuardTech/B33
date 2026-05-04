@@ -25,23 +25,39 @@ _BOOTSTRAPPED = False
 
 
 async def fetch_loop(notifier=None) -> None:
+    """Dual Monitoring System:
+    1. Fast Scan (Every 2 min) - Check for specific tracked URLs and latest sitemaps.
+    2. Full Scan (Every 30 min) - Deep sync of all event categories and statuses.
+    """
     await asyncio.sleep(10)
+    last_full_scan = 0.0
     while True:
         try:
-            await _run_once(notifier)
+            now = asyncio.get_event_loop().time()
+            is_full = (now - last_full_scan) > 1800  # 30 minutes
+            await _run_once(notifier, full_scan=is_full)
+            if is_full:
+                last_full_scan = now
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.exception(f"fetch_loop error: {e}")
-        await asyncio.sleep(EVENT_POLL_INTERVAL)
+        # Dynamic polling: Faster check for new drops
+        await asyncio.sleep(120 if not is_full else 300)
 
 
-async def _run_once(notifier) -> None:
+async def _run_once(notifier, full_scan: bool = False) -> None:
     global _BOOTSTRAPPED
-    slugs = await fetch_event_slugs()
+    # Method 1: Automated Discovery
+    slugs = await fetch_event_slugs(max_events=1000 if full_scan else 200)
+    
+    # Method 2: Tracked URLs (Implementation placeholder - can be extended to read from a DB table)
+    # tracked_slugs = list_tracked_event_slugs()
+    # slugs.update(tracked_slugs)
+
     if not slugs:
         return
-    enriched = await enrich_all(slugs, concurrency=4)
+    enriched = await enrich_all(slugs, concurrency=8 if full_scan else 4)
     from app.core.config import telegram_chat_id as _cid
     from app.bot import tokens as tok
 

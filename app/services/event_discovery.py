@@ -140,7 +140,9 @@ async def enrich_slug(slug: str, url: str = "") -> dict[str, Any] | None:
 
     # Also skip events that have no title at all (dead slugs)
     if not (ev.get("title") or ev.get("name")):
-        return None
+        # Check if it's a private event that only returns data on specific endpoints
+        if not tickets_data:
+            return None
 
     # Extract city (e.g. /en/SA/RUH/...) when present
     city = None
@@ -150,12 +152,12 @@ async def enrich_slug(slug: str, url: str = "") -> dict[str, Any] | None:
 
     # Category segment
     category = None
-    m = re.search(
-        r"/(experience|activities-adventures|sports-event|concerts|shows)/events/",
-        url,
-    )
-    if m:
-        category = m.group(1)
+    # Dynamic category extraction from URL or detail
+    category = ev.get("category_name") or ev.get("category_slug")
+    if not category:
+        m = re.search(r"/([^/]+)/events/", url)
+        if m:
+            category = m.group(1)
 
     title = ev.get("title") or ev.get("name") or slug
     return {

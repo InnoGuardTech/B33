@@ -111,12 +111,14 @@ def extract_blocks(rendering_info: Any,
             status = statuses.get(oid) or statuses.get(name) or ""
 
             # Determine free/total:
-            #   - capacity == 0 → unknown (chart designer didn't set it)
-            #   - availableForSale=False AND no live status → block hidden/sold-out
-            #   - availableForSale=True → assume `capacity` seats free until
-            #     /items endpoint says otherwise
+            # Check if object is selectable/viewable to avoid hidden seats
+            is_selectable = obj.get("selectable", True) is not False
+            is_viewable = obj.get("viewable", True) is not False
+            
             total = capacity if capacity > 0 else -1
-            if status:
+            if not is_selectable or not is_viewable:
+                free = 0
+            elif status:
                 # status takes priority when present
                 free = total if _is_free(status) else 0
             elif avail is True:

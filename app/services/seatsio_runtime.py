@@ -19,6 +19,8 @@ from app.services.seatsio_client import SeatsioClient
 log = logging.getLogger("seatsio_runtime")
 
 _PREWARM: dict[str, dict[str, Any]] = {}
+MAX_WARM_ENTRIES = 50  # Limit to prevent memory leak on Render Free
+
 
 
 async def ensure_event_warm(event_key: str) -> None:
@@ -34,6 +36,15 @@ async def ensure_event_warm(event_key: str) -> None:
         "last_update": 0.0,
         "task": None,
     }
+    # Cleanup old entries if limit reached
+    if len(_PREWARM) >= MAX_WARM_ENTRIES:
+        # Remove oldest 10%
+        to_remove = sorted(_PREWARM.keys(), key=lambda k: _PREWARM[k].get("last_update", 0))[:5]
+        for k in to_remove:
+            old_state = _PREWARM.pop(k, None)
+            if old_state and old_state.get("task"):
+                old_state["task"].cancel()
+
     _PREWARM[event_key] = state
 
     async def _loop():

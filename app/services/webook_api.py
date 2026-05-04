@@ -76,13 +76,15 @@ async def _json(session: aiohttp.ClientSession, method: str, url: str,
 # Public endpoints
 # ════════════════════════════════════════════════════════════════════════
 async def get_event_detail(slug: str,
-                           lang: Optional[str] = None
+                           lang: Optional[str] = None,
+                           bearer: Optional[str] = None
                            ) -> Optional[dict[str, Any]]:
     async with aiohttp.ClientSession() as s:
         status, data = await _json(
             s, "GET",
             f"{WEBOOK_API}/event-detail/{slug}"
             f"?lang={lang or WEBOOK_LANG}&visible_in=rs",
+            bearer=bearer,
             lang=lang,
         )
     if status == 200 and isinstance(data, dict):
@@ -91,7 +93,8 @@ async def get_event_detail(slug: str,
 
 
 async def get_event_tickets(slug: str,
-                            lang: Optional[str] = None) -> dict[str, Any]:
+                            lang: Optional[str] = None,
+                            bearer: Optional[str] = None) -> dict[str, Any]:
     """
     Returns:
       {"event": {...}, "tickets": [normalised dicts], "is_seated": bool}
@@ -101,6 +104,7 @@ async def get_event_tickets(slug: str,
             s, "GET",
             f"{WEBOOK_API}/event-ticket-details/{slug}"
             f"?lang={lang or WEBOOK_LANG}&visible_in=rs&page=1",
+            bearer=bearer,
             lang=lang,
         )
     if status != 200 or not isinstance(data, dict):

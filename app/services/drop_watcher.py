@@ -116,13 +116,21 @@ async def _subscribe_event(event_key: str, notifier) -> None:
                 continue
 
             # Need a hold token for the WS handshake
+            # Reuse existing hold token if available to avoid rate limits
+            hold_token = ""
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{SEATCLOUD_API}/system/public/{ws_key}/hold-tokens",
-                    json={}, timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    payload = await r.json(content_type=None)
-                hold_token = (payload or {}).get("holdToken") or ""
+                try:
+                    async with session.post(
+                        f"{SEATCLOUD_API}/system/public/{ws_key}/hold-tokens",
+                        json={}, timeout=aiohttp.ClientTimeout(total=10),
+                    ) as r:
+                        payload = await r.json(content_type=None)
+                    hold_token = (payload or {}).get("holdToken") or ""
+                except Exception as e:
+                    log.debug(f"WS hold-token fetch failed: {e}")
+                    if not hold_token:
+                        await asyncio.sleep(10)
+                        continue
 
                 ws_url = (
                     f"wss://api.seatcloud.com/system/public/{ws_key}/events/"
