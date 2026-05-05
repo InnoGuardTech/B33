@@ -65,7 +65,7 @@ def royal_categories_menu(counts: dict[str, int] | None = None
         }])
     rows.append([{"text": "✨  جميع الفعاليات المتاحة",
                   "callback_data": "cat:all:0"}])
-    rows.append([{"text": "🔄 تحديث القائمة",
+    rows.append([{"text": "🔄 تحديث القائمة الملكية",
                   "callback_data": "cats:refresh"}])
     rows.append([{"text": "🔙 العودة للقائمة الرئيسية",
                   "callback_data": "menu"}])
@@ -78,7 +78,8 @@ def events_keyboard(events: list[dict], page: int = 0,
     """V12 royal events list.
 
     Each row: status-dot + truncated title.
-      🟢 متاح بمقاعد  |  🟡 متاح بدون خريطة  |  🔴 نفد  (hidden anyway)
+      🟢 متاح بمقاعد  |  🟡 متاح بدون خريطة  |  🔴 نفد (hidden anyway)
+      👑 مميّز         |  💎 حصري
     """
     start = page * page_size
     chunk = events[start:start + page_size]

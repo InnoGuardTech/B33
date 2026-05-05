@@ -9,9 +9,11 @@ V12 Royal Schema:
   • events.sub_title, events.venue — denormalised for fast UI rendering
 
 V12 fixes the V11 deploy crash (column "royal_category" does not exist):
-the migration helper now uses information_schema on PostgreSQL, sqlite_master
-on Turso/SQLite, and runs idempotently inside init_db() BEFORE the first
-INSERT — so a brand-new PG database also gets the columns.
+  1. Migration runs FIRST, BEFORE any INSERT/SELECT on `royal_category`.
+  2. Migration is now backend-aware (information_schema on PG,
+     PRAGMA table_info on SQLite/Turso).
+  3. db.executescript now splits multi-statement scripts and runs each in
+     its own savepoint so a single ALTER failure does not poison the rest.
 """
 from __future__ import annotations
 
@@ -26,9 +28,92 @@ log = logging.getLogger("storage")
 
 
 # ════════════════════════════════════════════════════════════════════════
+# V12 schema migration helper — runs before any DML touches new columns
+# ════════════════════════════════════════════════════════════════════════
+_V12_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # (column, pg_type, sqlite_type)
+    ("royal_category",   "TEXT",                 "TEXT"),
+    ("end_date",         "BIGINT DEFAULT 0",     "INTEGER DEFAULT 0"),
+    ("has_availability", "INTEGER DEFAULT 1",    "INTEGER DEFAULT 1"),
+    ("sub_title",        "TEXT",                 "TEXT"),
+    ("venue",            "TEXT",                 "TEXT"),
+    ("first_seen_at",    "DOUBLE PRECISION",     "REAL"),
+    ("last_seen_at",     "DOUBLE PRECISION",     "REAL"),
+    ("last_checked_at",  "DOUBLE PRECISION",     "REAL"),
+)
+
+_V12_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_events_royal_cat  ON events(royal_category)",
+    "CREATE INDEX IF NOT EXISTS idx_events_avail      ON events(has_availability)",
+    "CREATE INDEX IF NOT EXISTS idx_events_end_date   ON events(end_date)",
+    "CREATE INDEX IF NOT EXISTS idx_events_first_seen ON events(first_seen_at)",
+    "CREATE INDEX IF NOT EXISTS idx_events_start_date ON events(start_date)",
+)
+
+_MIGRATED = False
+
+
+def _ensure_event_v12_columns() -> None:
+    """Idempotent migration that works across all 3 backends."""
+    global _MIGRATED
+    if _MIGRATED:
+        return
+    backend_name = _backend()
+    try:
+        with _conn() as con:
+            existing: set[str] = set()
+            if backend_name == "postgres":
+                cur = con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'events'"
+                )
+                for row in cur.fetchall():
+                    name = row.get("column_name") if isinstance(row, dict) else row[0]
+                    if name:
+                        existing.add(name)
+            else:
+                cur = con.execute("PRAGMA table_info(events)")
+                for row in cur.fetchall():
+                    if isinstance(row, dict):
+                        nm = row.get("name") or row.get(1)
+                        if nm:
+                            existing.add(nm)
+                    else:
+                        try:
+                            existing.add(row[1])
+                        except Exception:
+                            pass
+
+            for col, pg_type, sqlite_type in _V12_COLUMNS:
+                if col in existing:
+                    continue
+                ddl = pg_type if backend_name == "postgres" else sqlite_type
+                if backend_name == "postgres":
+                    sql = f"ALTER TABLE events ADD COLUMN IF NOT EXISTS {col} {ddl}"
+                else:
+                    sql = f"ALTER TABLE events ADD COLUMN {col} {ddl}"
+                try:
+                    con.execute(sql)
+                    log.info(f"[migration] events.{col} added ({backend_name})")
+                except Exception as e:
+                    log.debug(f"[migration] {col}: {e}")
+
+            for ix_sql in _V12_INDEXES:
+                try:
+                    con.execute(ix_sql)
+                except Exception:
+                    pass
+        _MIGRATED = True
+    except Exception as e:
+        log.error(f"[migration] V12 failed: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Schema bootstrap
 # ════════════════════════════════════════════════════════════════════════
 def init_db() -> None:
+    """Create tables if missing, then run V12 migration to add new columns
+    to legacy databases that pre-date V12."""
     with _conn() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS accounts (
@@ -126,111 +211,13 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_events_last_seen   ON events(last_seen_at);
         CREATE INDEX IF NOT EXISTS idx_events_start_date  ON events(start_date);
-        CREATE INDEX IF NOT EXISTS idx_events_first_seen  ON events(first_seen_at);
-        CREATE INDEX IF NOT EXISTS idx_events_royal_cat   ON events(royal_category);
-        CREATE INDEX IF NOT EXISTS idx_events_avail       ON events(has_availability);
         CREATE INDEX IF NOT EXISTS idx_accounts_status    ON accounts(status);
         CREATE INDEX IF NOT EXISTS idx_dropwatch_status   ON drop_watchers(status);
         CREATE INDEX IF NOT EXISTS idx_blocks_chat        ON event_blocks(chat_id);
         """)
-    # Always run V12 column-migration AFTER initial create so legacy
-    # databases (pre-V12 schema) get the new columns added.
+    # V12 migration MUST run after CREATE TABLE so legacy DBs (without
+    # royal_category etc.) get the columns added BEFORE any INSERT/SELECT.
     _ensure_event_v12_columns()
-
-
-# ════════════════════════════════════════════════════════════════════════
-# V12 schema migration — backend-aware (PostgreSQL / Turso / SQLite)
-# ════════════════════════════════════════════════════════════════════════
-_V12_COLUMNS: tuple[tuple[str, str], ...] = (
-    # (column_name, ddl_type)
-    ("royal_category", "TEXT"),
-    ("end_date", "INTEGER DEFAULT 0"),
-    ("has_availability", "INTEGER DEFAULT 1"),
-    ("sub_title", "TEXT"),
-    ("venue", "TEXT"),
-    ("first_seen_at", "DOUBLE PRECISION"),
-    ("last_seen_at", "DOUBLE PRECISION"),
-    ("last_checked_at", "DOUBLE PRECISION"),
-)
-
-_V12_INDEXES: tuple[str, ...] = (
-    "CREATE INDEX IF NOT EXISTS idx_events_royal_cat ON events(royal_category)",
-    "CREATE INDEX IF NOT EXISTS idx_events_avail     ON events(has_availability)",
-    "CREATE INDEX IF NOT EXISTS idx_events_end_date  ON events(end_date)",
-    "CREATE INDEX IF NOT EXISTS idx_events_first_seen ON events(first_seen_at)",
-)
-
-_MIGRATED = False
-
-
-def _ensure_event_v12_columns() -> None:
-    """Idempotent migration that works across all 3 backends.
-
-    The bug in V11: the helper used `PRAGMA table_info(events)` which
-    only exists on SQLite. On PostgreSQL it returned an empty list, so
-    no ALTER ran, then the INSERT (which references royal_category)
-    crashed with `column "royal_category" does not exist` and the whole
-    deploy entered the failed state.
-
-    V12 detects the active backend and uses information_schema on PG.
-    """
-    global _MIGRATED
-    if _MIGRATED:
-        return
-    backend_name = _backend()
-    try:
-        with _conn() as con:
-            existing: set[str] = set()
-            if backend_name == "postgres":
-                cur = con.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'events'"
-                )
-                existing = {
-                    (row.get("column_name") if isinstance(row, dict)
-                     else row[0])
-                    for row in cur.fetchall()
-                }
-            else:
-                # SQLite / Turso — PRAGMA still works because libsql speaks SQLite
-                cur = con.execute("PRAGMA table_info(events)")
-                rows = cur.fetchall()
-                for row in rows:
-                    if isinstance(row, dict):
-                        existing.add(row.get("name") or row.get(1))
-                    else:
-                        # tuple-like: (cid, name, type, notnull, dflt, pk)
-                        try:
-                            existing.add(row[1])
-                        except Exception:
-                            pass
-                existing.discard(None)
-
-            for col, ddl in _V12_COLUMNS:
-                if col in existing:
-                    continue
-                # PG-safe: ALTER TABLE … ADD COLUMN IF NOT EXISTS
-                if backend_name == "postgres":
-                    sql = (f"ALTER TABLE events "
-                           f"ADD COLUMN IF NOT EXISTS {col} {ddl}")
-                else:
-                    sql = f"ALTER TABLE events ADD COLUMN {col} {ddl}"
-                try:
-                    con.execute(sql)
-                    log.info(f"[migration] events.{col} added ({backend_name})")
-                except Exception as e:
-                    # Race condition / duplicate column → fine
-                    log.debug(f"[migration] {col}: {e}")
-
-            # Re-create royal indexes (cheap, idempotent)
-            for ix_sql in _V12_INDEXES:
-                try:
-                    con.execute(ix_sql)
-                except Exception:
-                    pass
-        _MIGRATED = True
-    except Exception as e:
-        log.error(f"[migration] V12 failed: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -306,14 +293,7 @@ def delete_account(account_id: str) -> None:
 # Events
 # ════════════════════════════════════════════════════════════════════════
 def upsert_event(slug: str, data: dict[str, Any]) -> bool:
-    """Returns True if this is a brand-new slug we hadn't seen before.
-
-    V12: stores royal_category, end_date, has_availability,
-    sub_title and venue alongside the legacy columns.
-
-    V12 also auto-deletes any DB row whose end_date is in the past
-    (silent housekeeping) so the public listing stays clean.
-    """
+    """Returns True if this is a brand-new slug we hadn't seen before."""
     now = time.time()
     _ensure_event_v12_columns()
     with _conn() as con:
@@ -362,10 +342,7 @@ def upsert_event(slug: str, data: dict[str, Any]) -> bool:
 
 
 def purge_ended_events(grace_seconds: int = 3600) -> int:
-    """V12 dynamic cleanup — delete rows whose end_date passed.
-
-    Returns the number of rows deleted. Safe to call repeatedly.
-    """
+    """V12 dynamic cleanup — delete rows whose end_date passed."""
     _ensure_event_v12_columns()
     cutoff = time.time() - grace_seconds
     deleted = 0
@@ -407,14 +384,7 @@ def list_recent_events(limit: int = 200,
                        royal_category: Optional[str] = None,
                        only_available: bool = True,
                        hide_ended: bool = True) -> list[dict[str, Any]]:
-    """V12 royal listing.
-
-    Returns events sorted newest-first (first_seen_at DESC, then earliest
-    upcoming start_date). Filters:
-      • hide_ended=True       — drop events whose end_date < now (-1h grace)
-      • only_available=True   — drop sold-out events (has_availability=0)
-      • royal_category=...    — keep only the given royal category key
-    """
+    """V12 royal listing — newest-first, ended dropped, sold-out hidden."""
     _ensure_event_v12_columns()
     where = []
     params: list[Any] = []
@@ -453,7 +423,7 @@ def list_recent_events(limit: int = 200,
 def count_events_by_royal_category(only_available: bool = True,
                                     hide_ended: bool = True
                                     ) -> dict[str, int]:
-    """V12: live counter for the royal category menu (5 sections)."""
+    """V12: live counter for the 5 royal sections."""
     _ensure_event_v12_columns()
     where = []
     params: list[Any] = []
