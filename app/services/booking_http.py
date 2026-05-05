@@ -27,6 +27,7 @@ from app.services.seatsio_client import (
     SeatsioClient, get_hold_token_from_webook,
 )
 from app.services.turnstile_solver import solve_turnstile, invalidate_cache
+from app.services.turnstile_solver import solve_turnstile, invalidate_cache
 from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
 from app.services.block_analyzer import (
     extract_blocks, find_seats_with_fallback, chart_is_sold_out,
@@ -285,6 +286,89 @@ async def clear_cart(session: aiohttp.ClientSession, parent_event_id: str, beare
             pass
 
 
+async def force_purge_cart(session: aiohttp.ClientSession, parent_event_id: str,
+                            bearer: str, max_iterations: int = 5) -> dict:
+    """v9 NUCLEAR cart cleanup: iteratively delete items until cart is empty.
+
+    Webook's /cart/clear endpoint sometimes leaves stale items behind. This
+    function GET-then-DELETE-then-GET loops until item_quantity reaches 0
+    (or max_iterations is hit). Critical because checkout fails with
+    'sold out' when cart has stale items from previous bookings (which used
+    to be misclassified as account_limit_reached in v8 and earlier).
+    """
+    state = {"iterations": 0, "final_quantity": -1, "items_deleted": 0}
+    for i in range(max_iterations):
+        state["iterations"] += 1
+        # First, try the bulk clear endpoints
+        for url in [
+            f"{WEBOOK_API}/cart/clear?lang=en&parent_event_id={parent_event_id}",
+            f"{WEBOOK_API}/cart/clear-cart?lang=en&parent_event_id={parent_event_id}",
+        ]:
+            try:
+                async with session.post(url, headers=build_headers(bearer),
+                                         timeout=aiohttp.ClientTimeout(total=8)):
+                    pass
+            except Exception:
+                pass
+
+        # Read current cart state
+        try:
+            async with session.get(
+                f"{WEBOOK_API}/cart?lang=en&parent_event_id={parent_event_id}",
+                headers=build_headers(bearer),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                d = await r.json(content_type=None)
+        except Exception:
+            d = {}
+        cart = (d or {}).get("data") or {}
+        qty = cart.get("item_quantity", 0) or 0
+        items = cart.get("cart_items") or []
+        cart_id = cart.get("_id", "") or ""
+        state["final_quantity"] = qty
+
+        if qty == 0 and not items:
+            return state  # cart is truly empty
+
+        # Delete each item individually via best-effort multiple endpoint shapes
+        for it in items:
+            item_id = it.get("_id") or ""
+            if not item_id:
+                continue
+            for url, method in [
+                (f"{WEBOOK_API}/cart/items/{item_id}?lang=en", "DELETE"),
+                (f"{WEBOOK_API}/cart/cart-items/{item_id}?lang=en", "DELETE"),
+                (f"{WEBOOK_API}/cart/remove-item?lang=en&item_id={item_id}", "POST"),
+            ]:
+                try:
+                    async with session.request(
+                        method, url, headers=build_headers(bearer),
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ) as r:
+                        if r.status in (200, 204):
+                            state["items_deleted"] += 1
+                            break
+                except Exception:
+                    pass
+
+        # Also try whole-cart delete by ID
+        if cart_id:
+            for url, method in [
+                (f"{WEBOOK_API}/cart/{cart_id}?lang=en", "DELETE"),
+                (f"{WEBOOK_API}/carts/{cart_id}?lang=en", "DELETE"),
+            ]:
+                try:
+                    async with session.request(
+                        method, url, headers=build_headers(bearer),
+                        timeout=aiohttp.ClientTimeout(total=6),
+                    ):
+                        pass
+                except Exception:
+                    pass
+
+    return state
+
+
 async def create_checkout(
     session: aiohttp.ClientSession,
     *,
@@ -296,6 +380,7 @@ async def create_checkout(
     bearer: str,
     payment_method: str = "credit_card",
     seat_payload: Optional[dict[str, Any]] = None,
+    turnstile_token: str = "",
 ) -> tuple[bool, dict]:
     body = {
         "event_id": event_id,
@@ -316,16 +401,12 @@ async def create_checkout(
     }
     if time_slot_id:
         body["time_slot_id"] = time_slot_id
+    if turnstile_token:
+        # v9: pass turnstile to checkout for events that require it
+        body["turnstile"] = turnstile_token
     if seat_payload:
-        # CRITICAL v7 fix: filter empty strings/lists/dicts. The field
-        # seats_io_category="" specifically triggers Cloudflare WAF 403
-        # on /checkout. Also de-duplicate hold_token aliases — webook
-        # only needs `hold_token` (snake_case); the camelCase aliases
-        # (`holdToken`, `seat_hold_token`) are redundant and increase
-        # the body fingerprint risk.
         clean = {k: v for k, v in seat_payload.items()
                   if v not in (None, "", [], {})}
-        # Drop redundant aliases
         clean.pop("holdToken", None)
         clean.pop("seat_hold_token", None)
         body.update(clean)
@@ -570,7 +651,22 @@ async def book_ticket_http(
         result["fatal"] = True
         return result
 
-    async with aiohttp.ClientSession() as session:
+    # v9 CRITICAL: Per-account ABSOLUTE ISOLATION.
+    # Each call gets its OWN ClientSession + CookieJar so cookies/state from
+    # one account NEVER bleed into another.
+    cookie_jar = aiohttp.CookieJar(unsafe=False)
+    connector = aiohttp.TCPConnector(
+        limit=8, ttl_dns_cache=300, force_close=False,
+        enable_cleanup_closed=True,
+    )
+    async with aiohttp.ClientSession(
+        cookie_jar=cookie_jar,
+        connector=connector,
+        trust_env=False,
+    ) as session:
+        result["logs"].append(
+            f"🔒 isolated session created (jar_id={id(cookie_jar)})"
+        )
         meta = await fetch_event_meta(session, slug, bearer)
         if not meta.get("event_id"):
             result["error"] = "transient:event_meta_unreachable"
@@ -674,7 +770,20 @@ async def book_ticket_http(
             else:
                 result["logs"].append("⚠️ no SeatCloud event key found — fallback only")
 
-        await clear_cart(session, event_id, bearer)
+        # v9 NUCLEAR cart purge: iteratively delete every cart item until
+        # webook reports item_quantity=0. Without this, stale items from
+        # previous bookings cause 'sold out' on checkout (misclassified as
+        # account_limit_reached in v8 and earlier).
+        purge = await force_purge_cart(session, event_id, bearer)
+        result["logs"].append(
+            f"🧹 nuclear purge: iter={purge.get('iterations')} "
+            f"deleted={purge.get('items_deleted')} final_qty={purge.get('final_quantity')}"
+        )
+        if purge.get("final_quantity", 0) > 0:
+            result["chart_unreachable"] = True
+            result["error"] = f"transient:cart_polluted:final_qty={purge['final_quantity']}"
+            return result
+
         ok, cart_data = await add_to_cart(
             session,
             ticket_id=ticket_id,
@@ -684,6 +793,33 @@ async def book_ticket_http(
             bearer=bearer,
             seat_payload=seat_payload,
         )
+        # v9: VERIFY post-add cart quantity — if mismatch, purge and retry
+        if ok and isinstance(cart_data, dict):
+            real_qty = cart_data.get("item_quantity", quantity)
+            if real_qty != quantity:
+                result["logs"].append(
+                    f"⚠️ cart_qty_mismatch wanted={quantity} got={real_qty} — forcing re-purge"
+                )
+                purge2 = await force_purge_cart(session, event_id, bearer, max_iterations=8)
+                result["logs"].append(
+                    f"🧹 re-purge: iter={purge2.get('iterations')} "
+                    f"deleted={purge2.get('items_deleted')} final_qty={purge2.get('final_quantity')}"
+                )
+                if purge2.get("final_quantity", 0) > 0:
+                    result["chart_unreachable"] = True
+                    result["error"] = (
+                        f"transient:cart_polluted_after_add:"
+                        f"final_qty={purge2['final_quantity']}"
+                    )
+                    return result
+                ok, cart_data = await add_to_cart(
+                    session, ticket_id=ticket_id, quantity=quantity,
+                    parent_event_id=event_id, time_slot_id=time_slot_id,
+                    bearer=bearer, seat_payload=seat_payload,
+                )
+                if ok and isinstance(cart_data, dict):
+                    real_qty = cart_data.get("item_quantity", quantity)
+                    result["logs"].append(f"🔄 re-add cart_qty={real_qty}")
         if not ok:
             errors_blob = (cart_data or {}).get("data", {}).get("errors") if isinstance(cart_data, dict) else None
             if not errors_blob and isinstance(cart_data, dict):
@@ -709,26 +845,75 @@ async def book_ticket_http(
             return result
         result["logs"].append(f"🛒 cart ok ({cart_data.get('item_quantity', quantity)} tickets)")
 
-        ok, co_data = await create_checkout(
-            session,
-            slug=slug,
-            event_id=event_id,
-            ticket_id=ticket_id,
-            quantity=quantity,
-            time_slot_id=time_slot_id,
-            bearer=bearer,
-            payment_method=payment_method,
-            seat_payload=seat_payload,
-        )
+        # v9: TRIPLE-RETRY checkout with fresh Turnstile + cart re-purge
+        # between each attempt. Webook sometimes rejects the FIRST checkout
+        # with 'sold out' (race / hold_token consumed) but accepts the
+        # second one with a new Turnstile token. This is NOT account_limit.
+        ok, co_data = False, {}
+        for co_attempt in range(1, 4):
+            ts_for_co = ""
+            if co_attempt > 1:
+                try:
+                    page_url = f"{WEBOOK_ORIGIN}/ar/events/{slug}"
+                    ts_for_co = await solve_turnstile(
+                        page_url, force_refresh=(co_attempt > 2),
+                    )
+                    if ts_for_co:
+                        result["logs"].append(
+                            f"🛡️ checkout-layer Turnstile applied (try {co_attempt})"
+                        )
+                except Exception as e:
+                    result["logs"].append(f"⚠️ checkout-turnstile err: {str(e)[:80]}")
+
+            ok, co_data = await create_checkout(
+                session,
+                slug=slug,
+                event_id=event_id,
+                ticket_id=ticket_id,
+                quantity=quantity,
+                time_slot_id=time_slot_id,
+                bearer=bearer,
+                payment_method=payment_method,
+                seat_payload=seat_payload,
+                turnstile_token=ts_for_co,
+            )
+            if ok:
+                break
+            raw = co_data if isinstance(co_data, dict) else {}
+            msg_l = (raw.get("message") or raw.get("error") or "").lower()
+            if "sold out" in msg_l or "already sold" in msg_l:
+                result["logs"].append(
+                    f"⚠️ checkout race try {co_attempt}/3 — retrying with fresh tokens"
+                )
+                await __import__("asyncio").sleep(1.5 * co_attempt)
+                await clear_cart(session, event_id, bearer)
+                ok2, _cd2 = await add_to_cart(
+                    session, ticket_id=ticket_id, quantity=quantity,
+                    parent_event_id=event_id, time_slot_id=time_slot_id,
+                    bearer=bearer, seat_payload=seat_payload,
+                )
+                if not ok2:
+                    break
+                continue
+            break
+
         if not ok:
             raw_body = co_data if isinstance(co_data, dict) else {}
             msg = (raw_body.get("message") or raw_body.get("error") or str(co_data))[:350]
             # v7: 'sold out' from webook for a seat we just got cart_ok for is
             # almost always due to per-account ticket limit (not real sell-out)
             msg_lower = str(msg).lower()
+            # v9 CRITICAL FIX: 'sold out' from webook is NOT a reliable signal
+            # of account-limit. The real account-limit error always comes via
+            # the structured 'errors' dict with text 'limit reached'. A
+            # 'sold out' on /checkout almost always means the seat assignment
+            # failed (no hold_token, stale cart, race condition with another
+            # buyer) — it must be RETRIED, not silently classified as a
+            # permanent account-limit.
             if "sold out" in msg_lower or "already sold" in msg_lower:
-                result["account_limit_reached"] = True
-                result["error"] = "account_limit_reached:sold_out_for_account"
+                result["chart_unreachable"] = True
+                result["error"] = f"transient:checkout_race:{msg[:120]}"
+                result["raw_response"] = str(co_data)[:500]
             elif "limit reached" in msg_lower:
                 result["account_limit_reached"] = True
                 result["error"] = f"account_limit_reached:{msg[:120]}"
