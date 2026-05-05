@@ -66,7 +66,7 @@ def _trace_id() -> str:
     return f"{int(time.time()*1000)}-{int(time.time()*1e6) % 100000:05d}"
 
 
-def _chart_headers(hold_token: str = "") -> dict[str, str]:
+def _chart_headers(hold_token: str = "", turnstile: str = "") -> dict[str, str]:
     h = {
         "accept": "application/json",
         "accept-encoding": "gzip, deflate",
@@ -74,9 +74,16 @@ def _chart_headers(hold_token: str = "") -> dict[str, str]:
         "origin": "https://chart.seatcloud.com",
         "referer": "https://chart.seatcloud.com/",
         "accept-language": "ar-SA,ar;q=0.9,en;q=0.8",
+        "sec-ch-ua": '"Not:A-Brand";v="99", "Chromium";v="128"',
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-mobile": "?0",
     }
     if hold_token:
         h["x-hold-token"] = hold_token
+    if turnstile:
+        # Some webook deployments accept the turnstile token at chart-level too
+        h["cf-turnstile-response"] = turnstile
+        h["x-turnstile-token"] = turnstile
     return h
 
 
@@ -554,19 +561,27 @@ class SeatsioClient:
                  workspace_key: str = "",
                  chart_key: str = "",
                  provider: str = "",
-                 hold_token: str = ""):
+                 hold_token: str = "",
+                 turnstile_token: str = ""):
         self.event_key = event_key
         self.workspace_key = workspace_key or ""
         self.chart_key = chart_key or ""
         self.provider = (provider or "").lower()
         self.hold_token = hold_token or ""
         self.hold_token_expires = 0.0
+        # v8: chart-layer Turnstile token — some webook deployments require
+        # one even when fetching the chart map (not just the hold-token).
+        self.turnstile_token = turnstile_token or ""
         self.session: Optional[aiohttp.ClientSession] = None
         self._ws_task: Optional[asyncio.Task] = None
         # Cached normalised payload
         self._cached_event: dict = {}
         self._cached_map: dict = {}
         self._cached_ri: dict = {}
+
+    def set_turnstile(self, token: str) -> None:
+        """Inject a Turnstile token to use for subsequent chart requests."""
+        self.turnstile_token = token or ""
 
     async def __aenter__(self):
         # Resolve workspace_key if missing — pull from the cached frontend tokens
@@ -617,10 +632,15 @@ class SeatsioClient:
             return {}
         url = (f"{SEATCLOUD_API}/api/v2/{self.workspace_key}/event/"
                f"{self.event_key}?trace_id={_trace_id()}&plain=true")
-        st, d = await self._get(url, headers=_chart_headers(self.hold_token))
+        st, d = await self._get(
+            url,
+            headers=_chart_headers(self.hold_token, self.turnstile_token),
+        )
         if st == 200 and isinstance(d, dict):
             self._cached_event = d
             return d
+        if st in (401, 403):
+            log.debug(f"fetch_event blocked status={st} for {self.event_key[:8]}")
         return {}
 
     async def fetch_map(self) -> dict:
@@ -628,10 +648,16 @@ class SeatsioClient:
             return {}
         url = (f"{SEATCLOUD_API}/api/v2/{self.workspace_key}/map/"
                f"{self.chart_key}/data?trace_id={_trace_id()}&plain=true")
-        st, d = await self._get(url, headers=_chart_headers(self.hold_token), timeout=20)
+        st, d = await self._get(
+            url,
+            headers=_chart_headers(self.hold_token, self.turnstile_token),
+            timeout=20,
+        )
         if st == 200 and isinstance(d, dict):
             self._cached_map = d
             return d
+        if st in (401, 403):
+            log.debug(f"fetch_map blocked status={st} for {self.chart_key[:8]}")
         return {}
 
     async def fetch_item_statuses(self) -> dict[str, str]:
@@ -641,7 +667,10 @@ class SeatsioClient:
                f"{self.event_key}/items?trace_id={_trace_id()}&plain=true")
         if self.hold_token:
             url += f"&hold_token={self.hold_token}"
-        st, d = await self._get(url, headers=_chart_headers(self.hold_token))
+        st, d = await self._get(
+            url,
+            headers=_chart_headers(self.hold_token, self.turnstile_token),
+        )
         # 204 = empty, no items held → all free
         if st in (200, 204):
             return _coerce_statuses(d)

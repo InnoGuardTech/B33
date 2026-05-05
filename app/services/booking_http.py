@@ -26,6 +26,7 @@ from app.core.config import (
 from app.services.seatsio_client import (
     SeatsioClient, get_hold_token_from_webook,
 )
+from app.services.turnstile_solver import solve_turnstile, invalidate_cache
 from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
 from app.services.block_analyzer import (
     extract_blocks, find_seats_with_fallback, chart_is_sold_out,
@@ -388,16 +389,19 @@ async def _reserve_seated_inventory(
     backup_blocks = backup_blocks or []
     legacy_targets = target_blocks()
 
-    # ── Step 1: get a hold-token from webook (preferred for seats_planner) ──
+    # ── Step 1: get a hold-token from webook (auto Turnstile bypass) ──
     webook_hold_token = ""
     if event_id:
         ht, ht_meta = await get_hold_token_from_webook(
             slug=slug, event_id=event_id, bearer=bearer,
             turnstile=turnstile_token,
+            auto_solve_turnstile=True,
         )
+        if ht_meta.get("turnstile_solved"):
+            logs.append("🛡️ Turnstile auto-solved")
         if ht_meta.get("turnstile_required"):
             meta["turnstile_required"] = True
-            logs.append("⚠️ webook hold-token requires Turnstile")
+            logs.append("⚠️ webook hold-token still requires Turnstile after bypass")
         if ht_meta.get("queued"):
             meta["queued"] = True
             meta["queue_position"] = ht_meta.get("waiting_number")
@@ -412,7 +416,10 @@ async def _reserve_seated_inventory(
     rendering_info = (snapshot or {}).get("rendering_info") if snapshot else None
     statuses = (snapshot or {}).get("statuses") if snapshot else None
 
-    # ── Step 3: open client with all keys + hold-token ──
+    # ── Step 3: fetch chart with internal retry + Turnstile bypass on failure ──
+    page_url = f"{WEBOOK_ORIGIN}/ar/events/{slug}"
+    chart_turnstile_token = ""
+    chart_attempts = 3
     async with SeatsioClient(
         event_key=event_key,
         workspace_key=workspace_key,
@@ -420,18 +427,39 @@ async def _reserve_seated_inventory(
         provider=provider,
         hold_token=webook_hold_token,
     ) as client:
-        if rendering_info is None:
-            rendering_info = await client.rendering_info()
-        if statuses is None:
-            statuses = await client.object_statuses()
+        for chart_try in range(1, chart_attempts + 1):
+            if rendering_info is None:
+                # Inject turnstile into chart-fetch headers when retrying
+                if chart_try > 1 and not chart_turnstile_token:
+                    try:
+                        chart_turnstile_token = await solve_turnstile(
+                            page_url, force_refresh=(chart_try > 2),
+                        )
+                        if chart_turnstile_token:
+                            client.set_turnstile(chart_turnstile_token)
+                            logs.append(f"🛡️ chart-layer Turnstile applied (try {chart_try})")
+                    except Exception as e:
+                        logs.append(f"⚠️ chart-layer turnstile solve err: {str(e)[:80]}")
+                rendering_info = await client.rendering_info()
+            if statuses is None:
+                statuses = await client.object_statuses()
+
+            if rendering_info and (rendering_info.get("objects") or []):
+                break  # success
+            # Else: chart fetch failed → reset and retry with bypass
+            logs.append(f"⚠️ chart fetch attempt {chart_try}/{chart_attempts} returned empty")
+            rendering_info = None
+            statuses = None
+            invalidate_cache(page_url)
+            await __import__("asyncio").sleep(1.0 * chart_try)
 
         meta["rendering_info"] = rendering_info
         meta["statuses"] = statuses
 
-        # No chart data at all? → transient error, NOT chart-full
+        # If after all retries the chart is still empty → transient (NOT full)
         if not rendering_info or not (rendering_info.get("objects") or []):
             meta["chart_unreachable"] = True
-            logs.append("⚠️ seats.io returned no chart data — transient/network error")
+            logs.append("⚠️ seats.io chart unreachable after retries")
             return None, logs, meta
 
         # ── Step 4: pick seats ──
@@ -538,13 +566,15 @@ async def book_ticket_http(
         "error": "",
     }
     if not bearer:
-        result["error"] = "لا يوجد توكن JWT صالح (يحتاج تسجيل دخول جديد)"
+        result["error"] = "no_bearer"
+        result["fatal"] = True
         return result
 
     async with aiohttp.ClientSession() as session:
         meta = await fetch_event_meta(session, slug, bearer)
         if not meta.get("event_id"):
-            result["error"] = "تعذّر جلب بيانات الفعالية"
+            result["error"] = "transient:event_meta_unreachable"
+            result["chart_unreachable"] = True
             return result
         event_id = meta["event_id"]
         result["logs"].append(f"📋 event_id={event_id[:8]} seated={meta['is_seated']}")
@@ -617,24 +647,23 @@ async def book_ticket_http(
                         "block": result["block_used"],
                     }
                 else:
+                    # v8: Use SHORT TECHNICAL CODES, not user-facing strings.
+                    # The orchestrator (book_one) is the SOLE authority for
+                    # deciding whether to retry, hard-fail or watch. The bot
+                    # presentation layer (handlers.py) is the SOLE authority
+                    # for what the user actually sees. Never write user-facing
+                    # Arabic prose here — it bypasses the retry pipeline.
                     if result["turnstile_required"]:
-                        result["error"] = (
-                            "هذه الفعالية تتطلب تحقق Cloudflare Turnstile. افتح الفعالية "
-                            "في المتصفح لإصدار رمز التحقق أولاً، ثم أعد المحاولة."
-                        )
+                        result["error"] = "transient:turnstile_required"
                     elif result["queued"]:
                         pos = seat_meta.get("queue_position") or "?"
-                        result["error"] = (
-                            f"الفعالية في طابور الانتظار (رقمك: {pos}). البوت سيعيد المحاولة تلقائياً."
-                        )
+                        result["error"] = f"transient:queued:{pos}"
                     elif result["chart_full"]:
-                        result["error"] = "الخريطة ممتلئة بالكامل — يمكنك تفعيل وضع الترقّب"
+                        result["error"] = "chart_full"
                     elif result["chart_unreachable"]:
-                        result["error"] = "تعذّر جلب بيانات خريطة المقاعد (خطأ شبكي، أعد المحاولة)."
+                        result["error"] = "transient:chart_unreachable"
                     else:
-                        result["error"] = (
-                            f"تعذّر إيجاد {quantity} مقعداً متجاورًا في البلوكات المختارة أو المجاورة."
-                        )
+                        result["error"] = f"no_contiguous_run:{quantity}"
                     result["seat_info"] = {
                         "event_key": manifest.get("event_key") or "",
                         "chart_key": manifest.get("chart_key") or "",
@@ -656,8 +685,6 @@ async def book_ticket_http(
             seat_payload=seat_payload,
         )
         if not ok:
-            # v7: detect 'ticket limit reached' (per-account subscription cap).
-            # webook returns it as data.errors[<id>].message containing 'limit reached'
             errors_blob = (cart_data or {}).get("data", {}).get("errors") if isinstance(cart_data, dict) else None
             if not errors_blob and isinstance(cart_data, dict):
                 errors_blob = cart_data.get("errors")
@@ -670,12 +697,15 @@ async def book_ticket_http(
             msg = limit_msg or (cart_data.get("message") or cart_data.get("error") or str(cart_data))[:300]
             if limit_msg:
                 result["account_limit_reached"] = True
-                result["error"] = (
-                    f"تم بلوغ الحد المسموح للحساب: {limit_msg}. "
-                    "جرّب حساباً آخر."
-                )
+                result["error"] = f"account_limit_reached:{limit_msg[:120]}"
             else:
-                result["error"] = f"فشل add-to-cart: {msg}"
+                # Detect transient errors at cart layer (Cloudflare/network)
+                msg_lower = str(msg).lower()
+                if any(h in msg_lower for h in ("cloudflare", "403", "502", "503", "504", "timeout", "timed out")):
+                    result["chart_unreachable"] = True
+                    result["error"] = f"transient:cart_blocked:{msg[:80]}"
+                else:
+                    result["error"] = f"add_to_cart_failed:{msg[:200]}"
             return result
         result["logs"].append(f"🛒 cart ok ({cart_data.get('item_quantity', quantity)} tickets)")
 
@@ -698,24 +728,21 @@ async def book_ticket_http(
             msg_lower = str(msg).lower()
             if "sold out" in msg_lower or "already sold" in msg_lower:
                 result["account_limit_reached"] = True
-                result["error"] = (
-                    "تم رفض الحجز من Webook (غالباً تجاوزت حد التذاكر للحساب أو "
-                    "المقعد المحدد لم يعد متاحاً). جرّب حساباً آخر."
-                )
+                result["error"] = "account_limit_reached:sold_out_for_account"
             elif "limit reached" in msg_lower:
                 result["account_limit_reached"] = True
-                result["error"] = f"تم بلوغ حد التذاكر للحساب: {msg}"
+                result["error"] = f"account_limit_reached:{msg[:120]}"
             elif "raw" in raw_body and raw_body.get("raw") == "-":
                 # Cloudflare 403 — transient, will be retried by orchestrator
                 result["chart_unreachable"] = True
-                result["error"] = "حُجبت من Cloudflare (سيُعاد المحاولة تلقائياً)."
+                result["error"] = "transient:cloudflare_blocked"
             else:
-                result["error"] = f"فشل checkout: {msg}"
+                result["error"] = f"checkout_failed:{msg[:200]}"
             return result
 
         pay_url = co_data.get("redirect_url") or (co_data.get("response") or {}).get("redirect_url")
         if not pay_url:
-            result["error"] = "checkout نجح لكن لم يرجع redirect_url"
+            result["error"] = "checkout_no_redirect_url"
             return result
 
         # Build rich seat_objects for the summarizer

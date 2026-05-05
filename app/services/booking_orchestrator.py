@@ -43,6 +43,52 @@ MAX_BACKOFF = 8.0          # cap
 
 
 # ════════════════════════════════════════════════════════════════════════
+# v8: Translate technical error codes from booking_http into user-facing
+# Arabic messages. This keeps a single source-of-truth for what the user
+# eventually sees, and prevents the engine from leaking outdated strings.
+# ════════════════════════════════════════════════════════════════════════
+def _humanize_error(res: dict) -> str:
+    """Convert internal error codes to user-friendly Arabic. Called only
+    when constructing the FINAL response sent to Telegram — never inside
+    retry loops (which use the raw codes for classification).
+    """
+    err = (res.get("error") or "").strip()
+    if not err:
+        return "فشل الحجز (سبب غير محدد)."
+
+    # Codes from booking_http
+    if err == "no_bearer":
+        return "توكن الحساب منتهي; سيُعاد تسجيل الدخول تلقائياً."
+    if err.startswith("transient:turnstile"):
+        return "تم حل تحدي Cloudflare تلقائياً — إعادة المحاولة..."
+    if err.startswith("transient:queued"):
+        pos = err.split(":", 2)[-1] if err.count(":") >= 2 else "?"
+        return f"في طابور الانتظار (رقمك: {pos}); سيُعاد المحاولة تلقائياً."
+    if err.startswith("transient:chart_unreachable") or \
+       err.startswith("transient:event_meta_unreachable") or \
+       err.startswith("transient:cloudflare_blocked") or \
+       err.startswith("transient:cart_blocked"):
+        return "عائق مؤقت في جلب بيانات الخريطة — سيُعاد المحاولة بتجاوز Cloudflare تلقائياً."
+    if err == "chart_full":
+        return "الخريطة ممتلئة تماماً — تفعيل وضع الترقّب."
+    if err.startswith("no_contiguous_run:"):
+        n = err.split(":", 1)[-1]
+        return f"تعذّر إيجاد {n} مقعداً متجاوراً في البلوكات المختارة."
+    if err.startswith("account_limit_reached"):
+        return "بلوغ حد التذاكر للحساب — سيُجرّب حساب آخر."
+    if err.startswith("checkout_failed:"):
+        msg = err.split(":", 1)[-1][:120]
+        return f"فشل إتمام الدفع: {msg}"
+    if err.startswith("add_to_cart_failed:"):
+        msg = err.split(":", 1)[-1][:120]
+        return f"فشل إضافة للسلة: {msg}"
+    if err == "checkout_no_redirect_url":
+        return "الحجز نجح لكن لم يرجع رابط دفع — حاول مرة أخرى."
+    # Anything else — strip code prefix if any
+    return err if not err.startswith("transient:") else err.split(":", 1)[-1]
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Strict watcher classification
 # ════════════════════════════════════════════════════════════════════════
 def _is_chart_truly_full(res: dict) -> bool:
@@ -82,14 +128,18 @@ def _is_transient_failure(res: dict) -> bool:
         return True
     if res.get("chart_unreachable"):
         return True
+    # v8: technical error codes (always lowercase prefix)
+    err = (res.get("error") or "")
+    if err.startswith("transient:"):
+        return True
     # Heuristic: error text contains transient hints
-    err = (res.get("error") or "").lower()
+    err_l = err.lower()
     transient_hints = (
         "timeout", "timed out", "network", "connection", "temporarily",
         "captcha", "turnstile", "queue", "rate limit", "429", "503", "502",
         "504", "reset", "broken", "unavailable", "cloudflare",
     )
-    if any(h in err for h in transient_hints):
+    if any(h in err_l for h in transient_hints):
         return True
     return False
 
@@ -408,9 +458,11 @@ async def book_one(
             }
 
     # All other failures → HARD FAIL, no watcher
+    # v8: humanize the error code into Arabic before returning to UI
     return {
         "ok": False, "account_id": assignment.account_id, "label": label,
-        "error": (res.get("error") or "فشل الحجز")[:320],
+        "error": _humanize_error(res)[:320],
+        "error_code": (res.get("error") or "")[:120],  # raw code for logs
         "failure_kind": kind,
         "logs": res.get("logs", []),
     }
