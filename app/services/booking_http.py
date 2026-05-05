@@ -617,6 +617,9 @@ async def book_ticket_http(
     backup_blocks: Optional[list[str]] = None,
     preheld_seats: Optional[list[str]] = None,
     preheld_token: str = "",
+    account_email: str = "",
+    account_user_id: str = "",
+    account_password: str = "",
 ) -> dict[str, Any]:
     """Main HTTP booking entry point.
 
@@ -900,16 +903,100 @@ async def book_ticket_http(
         if not ok:
             raw_body = co_data if isinstance(co_data, dict) else {}
             msg = (raw_body.get("message") or raw_body.get("error") or str(co_data))[:350]
-            # v7: 'sold out' from webook for a seat we just got cart_ok for is
-            # almost always due to per-account ticket limit (not real sell-out)
             msg_lower = str(msg).lower()
-            # v9 CRITICAL FIX: 'sold out' from webook is NOT a reliable signal
-            # of account-limit. The real account-limit error always comes via
-            # the structured 'errors' dict with text 'limit reached'. A
-            # 'sold out' on /checkout almost always means the seat assignment
-            # failed (no hold_token, stale cart, race condition with another
-            # buyer) — it must be RETRIED, not silently classified as a
-            # permanent account-limit.
+
+            # v10: Detect Cloudflare WAF block on /checkout endpoint.
+            # Signals: raw_body has key 'raw' with value '-' or empty (Cloudflare
+            # served a non-JSON HTML challenge / 403 page), OR the message
+            # explicitly mentions cloudflare/403/forbidden.
+            cloudflare_block = (
+                ("raw" in raw_body and raw_body.get("raw") in ("-", "", None))
+                or "cloudflare" in msg_lower
+                or "forbidden" in msg_lower
+                or "403" in msg_lower
+                or ("<html" in msg_lower and "cloudflare" in msg_lower)
+                or ("raw" in raw_body and isinstance(raw_body.get("raw"), str)
+                    and "<html" in raw_body["raw"].lower())
+            )
+
+            if cloudflare_block:
+                # v10 BREAKTHROUGH: WAF blocked /checkout via aiohttp.
+                # Open stealth Playwright browser, transplant cookies +
+                # bearer + hold_token, replay /checkout from inside browser.
+                # Real Chromium TLS/JA3 fingerprint defeats Cloudflare WAF.
+                result["logs"].append(
+                    "🚨 Cloudflare WAF detected on /checkout — invoking browser fallback (V10)"
+                )
+                try:
+                    from app.services.booking_playwright import checkout_via_browser_fallback
+
+                    # Snapshot ALL aiohttp cookies for transplant
+                    cookie_dump: list[dict[str, Any]] = []
+                    try:
+                        for cookie in cookie_jar:
+                            cookie_dump.append({
+                                "name": cookie.key,
+                                "value": cookie.value,
+                                "domain": cookie.get("domain") or ".webook.com",
+                                "path": cookie.get("path") or "/",
+                            })
+                    except Exception as e_dump:
+                        result["logs"].append(f"⚠️ cookie dump err: {str(e_dump)[:80]}")
+
+                    pw_res = await checkout_via_browser_fallback(
+                        bearer=bearer,
+                        user_id=account_user_id,
+                        email=account_email,
+                        slug=slug,
+                        event_id=event_id,
+                        ticket_id=ticket_id,
+                        quantity=quantity,
+                        time_slot_id=time_slot_id,
+                        payment_method=payment_method,
+                        seat_payload=seat_payload,
+                        aiohttp_cookies=cookie_dump,
+                        turnstile_token="",
+                    )
+                    result["logs"].extend(pw_res.get("logs", []))
+
+                    if pw_res.get("ok") and pw_res.get("payment_url"):
+                        # Build rich seat_objects for summarizer (same as success path)
+                        if rendering_info_for_summary and seat_payload:
+                            try:
+                                from app.services.block_analyzer import _walk_objects
+                                wanted = set(seat_payload.get("selected_seats") or [])
+                                objs = _walk_objects(rendering_info_for_summary)
+                                rich = []
+                                for o in objs:
+                                    oid = str(o.get("id") or o.get("objectId") or "")
+                                    label = o.get("labels", {}).get("displayedLabel") or o.get("label") or oid
+                                    if oid in wanted or label in wanted:
+                                        rich.append(o)
+                                result["seat_objects"] = rich
+                            except Exception:
+                                pass
+
+                        result["ok"] = True
+                        result["payment_url"] = pw_res["payment_url"]
+                        result["order_id"] = pw_res.get("order_id", "")
+                        result["payment_session_id"] = pw_res.get("payment_session_id", "")
+                        result["logs"].append("✅ V10 Browser-Fallback succeeded — WAF bypassed")
+                        return result
+                    else:
+                        # Browser fallback also failed — treat as transient
+                        result["chart_unreachable"] = True
+                        result["error"] = (
+                            f"transient:cloudflare_blocked:browser_fallback_failed:"
+                            f"{(pw_res.get('error') or '')[:120]}"
+                        )
+                        return result
+                except Exception as e_pw:
+                    result["logs"].append(f"⚠️ V10 browser fallback exception: {str(e_pw)[:120]}")
+                    result["chart_unreachable"] = True
+                    result["error"] = f"transient:cloudflare_blocked:exc:{str(e_pw)[:80]}"
+                    return result
+
+            # Non-Cloudflare classifications
             if "sold out" in msg_lower or "already sold" in msg_lower:
                 result["chart_unreachable"] = True
                 result["error"] = f"transient:checkout_race:{msg[:120]}"
@@ -917,10 +1004,6 @@ async def book_ticket_http(
             elif "limit reached" in msg_lower:
                 result["account_limit_reached"] = True
                 result["error"] = f"account_limit_reached:{msg[:120]}"
-            elif "raw" in raw_body and raw_body.get("raw") == "-":
-                # Cloudflare 403 — transient, will be retried by orchestrator
-                result["chart_unreachable"] = True
-                result["error"] = "transient:cloudflare_blocked"
             else:
                 result["error"] = f"checkout_failed:{msg[:200]}"
             return result

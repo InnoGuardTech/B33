@@ -299,6 +299,9 @@ async def book_one(
             ticket_meta=ticket_meta,
             primary_block=primary_block,
             backup_blocks=backup_blocks,
+            account_email=acc.get("email", "") or "",
+            account_user_id=acc.get("user_id", "") or "",
+            account_password=acc.get("password", "") or "",
         )
         last_res = res
 
@@ -404,6 +407,9 @@ async def book_one(
                     quantity=assignment.quantity,
                     payment_method=payment_method, ticket_meta=ticket_meta,
                     primary_block=primary_block, backup_blocks=backup_blocks,
+                    account_email=acc.get("email", "") or "",
+                    account_user_id=acc.get("user_id", "") or "",
+                    account_password=acc.get("password", "") or "",
                 )
                 if retry_res.get("ok"):
                     pay_url = retry_res.get("payment_url", "")

@@ -734,3 +734,238 @@ async def _scrape_seat_info(page) -> dict[str, str]:
         except Exception:
             continue
     return {"section": "", "row": "", "seat_number": ""}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# v10: Checkout-via-Browser Fallback
+# ────────────────────────────────────────────────────────────────────────
+# When aiohttp hits Cloudflare WAF (HTTP 403) on POST /checkout, we open a
+# stealth Playwright browser, transplant the bearer token, hold_token,
+# selected seats and ALL aiohttp cookies into the browser context, then
+# replay the EXACT /checkout request from inside the page (so it carries
+# real Chromium TLS fingerprint + JA3 + canvas/WebGL signals). Cloudflare
+# WAF treats it as a legitimate browser session and lets it through,
+# returning the PayTabs redirect URL.
+# ════════════════════════════════════════════════════════════════════════
+async def checkout_via_browser_fallback(
+    *,
+    bearer: str,
+    user_id: str,
+    email: str,
+    slug: str,
+    event_id: str,
+    ticket_id: str,
+    quantity: int,
+    time_slot_id: Optional[str],
+    payment_method: str,
+    seat_payload: Optional[dict[str, Any]],
+    aiohttp_cookies: Optional[list[dict[str, Any]]] = None,
+    turnstile_token: str = "",
+    max_runtime: int = 90,
+) -> dict[str, Any]:
+    """V10 WAF bypass: replay /checkout from inside a real Chromium browser.
+
+    Returns dict with keys:
+      ok: bool
+      payment_url: str
+      order_id: str
+      payment_session_id: str
+      logs: list[str]
+      error: str
+    """
+    out: dict[str, Any] = {
+        "ok": False, "payment_url": "", "order_id": "",
+        "payment_session_id": "", "logs": [], "error": "",
+    }
+    if _pw_err is not None:
+        out["error"] = f"Playwright unavailable: {_pw_err}"
+        return out
+
+    deadline = time.time() + max_runtime
+
+    body: dict[str, Any] = {
+        "event_id": event_id,
+        "redirect": f"{WEBOOK_ORIGIN}/en/payment-success",
+        "redirect_failed": f"{WEBOOK_ORIGIN}/en/payment-failed",
+        "booking_source": "rs-web",
+        "lang": "en",
+        "payment_method": payment_method or "credit_card",
+        "is_wallet": False,
+        "saudi_redeem": None,
+        "refund_guarantee": False,
+        "perks": [],
+        "merchandise": [],
+        "addons": [],
+        "vouchers": [],
+        "tickets": [{"qty": quantity, "id": ticket_id}],
+        "app_source": "rs",
+    }
+    if time_slot_id:
+        body["time_slot_id"] = time_slot_id
+    if turnstile_token:
+        body["turnstile"] = turnstile_token
+    if seat_payload:
+        clean = {k: v for k, v in seat_payload.items()
+                 if v not in (None, "", [], {})}
+        clean.pop("holdToken", None)
+        clean.pop("seat_hold_token", None)
+        body.update(clean)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+            proxy=(
+                {
+                    "server": proxy_server().strip(),
+                    **({"username": proxy_username().strip()} if proxy_username().strip() else {}),
+                    **({"password": proxy_password().strip()} if proxy_password().strip() else {}),
+                }
+                if proxy_server().strip() else None
+            ),
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/128.0.0.0 Safari/537.36"
+            ),
+            locale="ar-SA",
+            viewport={"width": 1366, "height": 900},
+        )
+
+        try:
+            # 1) Inject saved auth into localStorage
+            if bearer:
+                await _install_saved_auth(ctx, bearer, user_id, email)
+
+            # 2) Transplant aiohttp cookies into browser context
+            if aiohttp_cookies:
+                pw_cookies = []
+                for c in aiohttp_cookies:
+                    try:
+                        name = c.get("name")
+                        value = c.get("value")
+                        if not name or value is None:
+                            continue
+                        domain = c.get("domain") or ".webook.com"
+                        if not domain.startswith(".") and "webook.com" in domain:
+                            domain = "." + domain.lstrip(".")
+                        pw_cookies.append({
+                            "name": name,
+                            "value": str(value),
+                            "domain": domain,
+                            "path": c.get("path") or "/",
+                            "secure": True,
+                            "httpOnly": False,
+                            "sameSite": "Lax",
+                        })
+                    except Exception:
+                        continue
+                if pw_cookies:
+                    try:
+                        await ctx.add_cookies(pw_cookies)
+                        out["logs"].append(f"🍪 transplanted {len(pw_cookies)} cookies into browser")
+                    except Exception as e:
+                        out["logs"].append(f"⚠️ cookie transplant err: {str(e)[:80]}")
+
+            # 3) Set browser-wide auth headers for ALL fetches
+            await ctx.set_extra_http_headers({
+                "token": WEBOOK_PUBLIC_TOKEN,
+                "authorization": f"Bearer {bearer}" if bearer else "Bearer",
+                "accept-language": "ar-SA",
+                "origin": WEBOOK_ORIGIN,
+                "referer": f"{WEBOOK_ORIGIN}/en/events/{slug}",
+            })
+
+            page = await ctx.new_page()
+            seen_paytabs: list[str] = []
+            page.on("request", lambda r: (
+                seen_paytabs.append(r.url) if ("paytabs" in r.url.lower() and r.url not in seen_paytabs) else None
+            ))
+            page.on("response", lambda r: (
+                seen_paytabs.append(r.url) if ("paytabs" in r.url.lower() and r.url not in seen_paytabs) else None
+            ))
+
+            # 4) Warm-up: visit event page so Cloudflare cookies populate naturally
+            try:
+                await page.goto(
+                    f"{WEBOOK_ORIGIN}/en/events/{slug}",
+                    wait_until="domcontentloaded", timeout=45000,
+                )
+                await page.wait_for_timeout(3000)
+                out["logs"].append("🔥 warm-up page loaded (CF cookies primed)")
+            except Exception as e:
+                out["logs"].append(f"⚠️ warm-up nav err: {str(e)[:80]}")
+
+            if time.time() > deadline:
+                out["error"] = "timeout_during_warmup"
+                return out
+
+            # 5) Replay the /checkout request from inside the browser context.
+            # Browser fetch carries real Chromium TLS/JA3 fingerprint + cookies.
+            checkout_url = f"{WEBOOK_API}/event-detail/{slug}/checkout?lang=en"
+            replay_script = f"""async () => {{
+              try {{
+                const r = await fetch({json.dumps(checkout_url)}, {{
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {{
+                    'accept': 'application/json',
+                    'content-type': 'application/json',
+                    'token': {json.dumps(WEBOOK_PUBLIC_TOKEN)},
+                    'authorization': {json.dumps('Bearer ' + bearer if bearer else 'Bearer')},
+                    'accept-language': 'ar-SA',
+                  }},
+                  body: JSON.stringify({json.dumps(body)}),
+                }});
+                const txt = await r.text();
+                return {{ status: r.status, body: txt }};
+              }} catch (e) {{
+                return {{ status: 0, body: String(e) }};
+              }}
+            }}"""
+            replay = await page.evaluate(replay_script)
+            status = replay.get("status", 0)
+            raw_body = replay.get("body", "") or ""
+            out["logs"].append(f"🌐 browser-replay /checkout → {status}")
+
+            try:
+                payload = json.loads(raw_body)
+            except Exception:
+                payload = {}
+
+            if status == 200 and isinstance(payload, dict) and payload.get("status") == "success":
+                data = payload.get("data") or {}
+                pay_url = data.get("redirect_url") or (data.get("response") or {}).get("redirect_url") or ""
+                if not pay_url and seen_paytabs:
+                    pay_url = seen_paytabs[0]
+                if pay_url:
+                    out["ok"] = True
+                    out["payment_url"] = pay_url
+                    out["order_id"] = data.get("order_id", "")
+                    out["payment_session_id"] = data.get("payment_session_id", "")
+                    out["logs"].append("💳 PayTabs URL captured via browser fallback")
+                else:
+                    out["error"] = "browser_checkout_no_redirect_url"
+            else:
+                msg = (
+                    (payload.get("message") if isinstance(payload, dict) else None)
+                    or (payload.get("error") if isinstance(payload, dict) else None)
+                    or raw_body[:300]
+                )
+                out["error"] = f"browser_checkout_failed:{status}:{str(msg)[:200]}"
+        except Exception as e:
+            out["error"] = f"browser_fallback_exception:{str(e)[:200]}"
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    return out
