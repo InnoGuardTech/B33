@@ -41,13 +41,14 @@ from app.services.webook_api import get_event_detail, get_event_tickets
 log = logging.getLogger("handlers")
 
 WELCOME = (
-    "👑  <b>بوابة Webook الملكية</b>  ⛜️\n"
-    "════════════════════════\n"
+    "👑  <b>بوابة Webook الملكيّة</b>  💎\n"
+    "══════════════════════════\n"
     "أهلاً بك في أرقى بوابة حجز للفعاليات داخل المملكة.\n\n"
-    "⛜️ حجز فوري للمباريات والحفلات والمسارح.\n"
-    "⛜️ محرّك حجز متوازٍ عبر حسابات متعدّدة.\n"
-    "⛜️ تجاوز ملكيّ لحماية Cloudflare تلقائيّاً.\n\n"
-    "════════════════════════\n"
+    "💎 حجز فوري للمباريات والحفلات والمسارح والتجارب والمعارض.\n"
+    "💎 محرّك حجز متوازٍ عبر حسابات متعدّدة.\n"
+    "💎 تجاوز ملكيّ لحماية Cloudflare تلقائيّاً.\n"
+    "💎 تنظيف آليّ: المنتهية والمُنفدة تختفي فوراً.\n\n"
+    "══════════════════════════\n"
     "👑 <b>اختر مسارك:</b>"
 )
 
@@ -617,19 +618,25 @@ def _build_picker_caption(sess: dict) -> str:
 # V11 Royal Categories — luxurious browsing experience
 # ════════════════════════════════════════════════════════════════════════
 ROYAL_CATEGORY_TITLES = {
-    "sports":   ("⚽️", "الرياضة والمباريات"),
-    "theater":  ("🎭", "المسرح والعروض"),
-    "concerts": ("🎤", "الحفلات والترفيه"),
-    "all":      ("✨", "جميع الفعاليات المتاحة"),
+    "sports":      ("⚽️", "الرياضة والمباريات"),
+    "concerts":    ("🎤", "الموسيقى والحفلات"),
+    "theater":     ("🎭", "المسرح والفنون"),
+    "experiences": ("🎡", "الترفيه والتجارب"),
+    "exhibitions": ("🖼", "المعارض والمتاحف"),
+    "all":         ("✨", "جميع الفعاليات المتاحة"),
 }
 
 
 async def _refresh_events_from_webook() -> int:
-    """Pull fresh events from Webook sitemaps and persist them.
-
-    Returns the count of fresh events persisted.
-    """
-    slugs = await fetch_event_slugs(max_events=240)
+    """V12: pull fresh events, purge ended ones, persist and return count."""
+    # Step 1: housekeeping — drop expired events from DB.
+    try:
+        from app.core.storage import purge_ended_events
+        purge_ended_events(grace_seconds=3600)
+    except Exception as e:
+        log.debug(f"purge_ended_events: {e}")
+    # Step 2: refresh from Webook sitemaps + experience sitemaps.
+    slugs = await fetch_event_slugs(max_events=320)
     events = await enrich_all(slugs, concurrency=6)
     for e in events:
         upsert_event(e["slug"], e)
@@ -648,7 +655,7 @@ async def _show_categories_menu(chat_id: str, msg_id: int,
         await notifier.edit(
             chat_id, msg_id,
             "👑  <b>تحديث البوابة الملكيّة</b>\n"
-            "════════════════════════\n"
+            "══════════════════════════\n"
             "⏳ جارٍ سحب أحدث الفعاليات وتصفية المنتهية...",
             reply_markup=None,
         )
@@ -660,19 +667,26 @@ async def _show_categories_menu(chat_id: str, msg_id: int,
                                                   hide_ended=True)
         total_now = sum(counts.values())
 
-    sport_n = counts.get("sports", 0)
-    theater_n = counts.get("theater", 0)
-    concert_n = counts.get("concerts", 0)
+    sport_n      = counts.get("sports", 0)
+    concert_n    = counts.get("concerts", 0)
+    theater_n    = counts.get("theater", 0)
+    experience_n = counts.get("experiences", 0)
+    exhibition_n = counts.get("exhibitions", 0)
 
     txt = (
-        "👑  <b>البوابة الملكيّة للفعاليات</b>  ⛜️\n"
-        "════════════════════════\n"
-        f"⛜️ <b>إجمالي ما يمكن حجزه الآن:</b> {total_now} فعالية\n\n"
+        "👑  <b>البوابة الملكيّة للفعاليات</b>  💎\n"
+        "══════════════════════════\n"
+        f"💎 <b>إجمالي ما يمكن حجزه الآن:</b> {total_now} فعالية\n\n"
         f"⚽️ الرياضة والمباريات ـ <b>{sport_n}</b>\n"
-        f"🎭 المسرح والعروض ـ <b>{theater_n}</b>\n"
-        f"🎤 الحفلات والترفيه ـ <b>{concert_n}</b>\n"
-        "════════════════════════\n"
-        "✨ <i>اختر تصنيفاً لتصفح فعالياته المتاحة حصراً.</i>"
+        f"🎤 الموسيقى والحفلات ـ <b>{concert_n}</b>\n"
+        f"🎭 المسرح والفنون ـ <b>{theater_n}</b>\n"
+        f"🎡 الترفيه والتجارب ـ <b>{experience_n}</b>\n"
+        f"🖼 المعارض والمتاحف ـ <b>{exhibition_n}</b>\n"
+        "══════════════════════════\n"
+        "✨ <i>تنظيم آلي تلقائي: تُخفى الفعاليات المنتهية أو\n"
+        "المنفدة فورياً لتجربة بريميوم نظيفة.</i>\n"
+        "══════════════════════════\n"
+        "👑 <i>اختر تصنيفاً لتصفح فعالياته الحصريّة.</i>"
     )
     await notifier.edit(
         chat_id, msg_id, txt,
@@ -684,7 +698,8 @@ async def _show_events_in_category(chat_id: str, msg_id: int,
                                      cat_key: str, arg: str,
                                      notifier: Notifier) -> None:
     """List events filtered by royal category with luxurious framing."""
-    if cat_key not in ("sports", "theater", "concerts", "all"):
+    if cat_key not in ("sports", "concerts", "theater",
+                       "experiences", "exhibitions", "all"):
         cat_key = "all"
 
     if arg == "refresh":
@@ -693,7 +708,7 @@ async def _show_events_in_category(chat_id: str, msg_id: int,
         await notifier.edit(
             chat_id, msg_id,
             f"{emoji}  <b>{ar_label}</b>\n"
-            "════════════════════════\n"
+            "══════════════════════════\n"
             "🔄 جارٍ تحديث الفعاليات وتصفية المنتهية...",
             reply_markup=None,
         )
@@ -735,10 +750,10 @@ async def _show_events_in_category(chat_id: str, msg_id: int,
     if not events:
         txt = (
             f"{emoji}  <b>{ar_label}</b>\n"
-            "════════════════════════\n"
+            "══════════════════════════\n"
             "⚠️ لا توجد فعاليات متاحة حالياً في هذا التصنيف.\n"
             "<i>تمّ تصفية كل فعالية منتهية أو مبيعة بالكامل تلقائياً.</i>\n\n"
-            "⛜️ جرّب تحديث القائمة أو تصفح تصنيفاً آخر."
+            "💎 جرّب تحديث القائمة أو تصفح تصنيفاً آخر."
         )
         await notifier.edit(
             chat_id, msg_id, txt,
@@ -754,12 +769,12 @@ async def _show_events_in_category(chat_id: str, msg_id: int,
 
     header = (
         f"{emoji}  <b>{ar_label}</b>\n"
-        "════════════════════════\n"
-        f"⛜️ عدد الفعاليات المتاحة: <b>{total}</b>\n"
+        "══════════════════════════\n"
+        f"💎 عدد الفعاليات المتاحة: <b>{total}</b>\n"
         f"📄 الصفحة <b>{page + 1}</b> من <b>{total_pages}</b>\n"
-        "════════════════════════\n"
-        "🟢 متاح وفير   🟡 محدود   ⚫ بدون خريطة\n"
-        "════════════════════════\n"
+        "══════════════════════════\n"
+        "🟢 مقاعد مرسومة   🟡 بدون خريطة   👑 الأحدث أولاً\n"
+        "══════════════════════════\n"
         "✨ <i>اضغط على فعالية لعرض تذاكرها الملكيّة:</i>"
     )
     await notifier.edit(
@@ -820,10 +835,10 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
 
     txt = (
         f"👑  <b>{title}</b>\n"
-        "════════════════════════\n"
+        "══════════════════════════\n"
     )
     if sub:
-        txt += f"⛜️ <i>{sub}</i>\n"
+        txt += f"💎 <i>{sub}</i>\n"
     if date_line:
         txt += f"📅 <b>التاريخ:</b> <code>{date_line}</code>\n"
     if venue:
@@ -833,15 +848,15 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
 
     if active:
         txt += (
-            "\n════════════════════════\n"
+            "\n══════════════════════════\n"
             f"🎟️ <b>أنواع التذاكر الملكيّة:</b>  {len(active)}\n"
-            "════════════════════════\n"
+            "══════════════════════════\n"
             "✨ <i>اختر فئة تذكرتك:</i>"
         )
         rkb = kb.ticket_types_keyboard(slug, tickets)
     else:
         txt += (
-            "\n════════════════════════\n"
+            "\n══════════════════════════\n"
             "⚠️ <i>لا توجد تذاكر متاحة الآن.</i>\n"
             "قد تكون الفعالية تتطلب اشتراكاً أو لم يُفتح بيعها بعد."
         )

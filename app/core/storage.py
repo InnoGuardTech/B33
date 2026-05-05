@@ -1,24 +1,33 @@
 """
-Persistence layer backed by either Turso (cloud SQLite) or local sqlite3.
+Persistence layer backed by PostgreSQL, Turso (cloud SQLite) or local sqlite3.
 
-Tables:
-  • accounts       — email/password + JWT tokens per account
-  • events         — cached events seen on Webook
-  • bookings       — successful bookings (one row per account per booking)
-  • bot_settings   — runtime-tunable settings managed via admin UI
-  • event_blocks   — user-selected primary/backup blocks per event
-  • drop_watchers  — accounts watching for seat drops on full charts
-  • seat_maps      — cached seats.io rendering_info per chart_key
+V12 Royal Schema:
+  • events.royal_category   — one of {sports, concerts, theater,
+                                       experiences, exhibitions}
+  • events.end_date         — epoch seconds (used to filter ended events)
+  • events.has_availability — 0/1 sold-out flag
+  • events.sub_title, events.venue — denormalised for fast UI rendering
+
+V12 fixes the V11 deploy crash (column "royal_category" does not exist):
+the migration helper now uses information_schema on PostgreSQL, sqlite_master
+on Turso/SQLite, and runs idempotently inside init_db() BEFORE the first
+INSERT — so a brand-new PG database also gets the columns.
 """
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Optional
 
-from app.core.db import connect as _conn
+from app.core.db import backend as _backend, connect as _conn
+
+log = logging.getLogger("storage")
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Schema bootstrap
+# ════════════════════════════════════════════════════════════════════════
 def init_db() -> None:
     with _conn() as con:
         con.executescript("""
@@ -31,7 +40,7 @@ def init_db() -> None:
             refresh_token   TEXT,
             token_expires_at REAL DEFAULT 0,
             user_id         TEXT,
-            status          TEXT DEFAULT 'new',   -- new/ready/refreshing/blocked/needs_relogin
+            status          TEXT DEFAULT 'new',
             last_used_at    REAL DEFAULT 0,
             tickets_booked  INTEGER DEFAULT 0,
             last_error      TEXT,
@@ -66,11 +75,11 @@ def init_db() -> None:
             ticket_type     TEXT,
             account_id      TEXT,
             quantity        INTEGER,
-            seat_info       TEXT,     -- JSON
+            seat_info       TEXT,
             payment_url     TEXT,
             total_amount    REAL,
             currency        TEXT,
-            status          TEXT,     -- pending/paid/cancelled/expired
+            status          TEXT,
             created_at      REAL
         );
 
@@ -87,7 +96,7 @@ def init_db() -> None:
             event_slug      TEXT,
             ticket_type_id  TEXT,
             primary_block   TEXT,
-            backup_blocks   TEXT,    -- JSON list, in order
+            backup_blocks   TEXT,
             quantity        INTEGER,
             payment_method  TEXT DEFAULT 'credit_card',
             created_at      REAL
@@ -101,8 +110,8 @@ def init_db() -> None:
             event_key       TEXT,
             ticket_type_id  TEXT,
             quantity        INTEGER,
-            blocks_pref     TEXT,     -- JSON list (primary,backup,neighbors)
-            status          TEXT DEFAULT 'watching',  -- watching/captured/cancelled
+            blocks_pref     TEXT,
+            status          TEXT DEFAULT 'watching',
             created_at      REAL,
             updated_at      REAL
         );
@@ -110,8 +119,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS seat_maps (
             chart_key       TEXT PRIMARY KEY,
             event_key       TEXT,
-            rendering_info  TEXT,     -- JSON
-            blocks_meta     TEXT,     -- JSON: [{name, center_x, center_y, free_count}]
+            rendering_info  TEXT,
+            blocks_meta     TEXT,
             updated_at      REAL
         );
 
@@ -124,6 +133,104 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_dropwatch_status   ON drop_watchers(status);
         CREATE INDEX IF NOT EXISTS idx_blocks_chat        ON event_blocks(chat_id);
         """)
+    # Always run V12 column-migration AFTER initial create so legacy
+    # databases (pre-V12 schema) get the new columns added.
+    _ensure_event_v12_columns()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# V12 schema migration — backend-aware (PostgreSQL / Turso / SQLite)
+# ════════════════════════════════════════════════════════════════════════
+_V12_COLUMNS: tuple[tuple[str, str], ...] = (
+    # (column_name, ddl_type)
+    ("royal_category", "TEXT"),
+    ("end_date", "INTEGER DEFAULT 0"),
+    ("has_availability", "INTEGER DEFAULT 1"),
+    ("sub_title", "TEXT"),
+    ("venue", "TEXT"),
+    ("first_seen_at", "DOUBLE PRECISION"),
+    ("last_seen_at", "DOUBLE PRECISION"),
+    ("last_checked_at", "DOUBLE PRECISION"),
+)
+
+_V12_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_events_royal_cat ON events(royal_category)",
+    "CREATE INDEX IF NOT EXISTS idx_events_avail     ON events(has_availability)",
+    "CREATE INDEX IF NOT EXISTS idx_events_end_date  ON events(end_date)",
+    "CREATE INDEX IF NOT EXISTS idx_events_first_seen ON events(first_seen_at)",
+)
+
+_MIGRATED = False
+
+
+def _ensure_event_v12_columns() -> None:
+    """Idempotent migration that works across all 3 backends.
+
+    The bug in V11: the helper used `PRAGMA table_info(events)` which
+    only exists on SQLite. On PostgreSQL it returned an empty list, so
+    no ALTER ran, then the INSERT (which references royal_category)
+    crashed with `column "royal_category" does not exist` and the whole
+    deploy entered the failed state.
+
+    V12 detects the active backend and uses information_schema on PG.
+    """
+    global _MIGRATED
+    if _MIGRATED:
+        return
+    backend_name = _backend()
+    try:
+        with _conn() as con:
+            existing: set[str] = set()
+            if backend_name == "postgres":
+                cur = con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'events'"
+                )
+                existing = {
+                    (row.get("column_name") if isinstance(row, dict)
+                     else row[0])
+                    for row in cur.fetchall()
+                }
+            else:
+                # SQLite / Turso — PRAGMA still works because libsql speaks SQLite
+                cur = con.execute("PRAGMA table_info(events)")
+                rows = cur.fetchall()
+                for row in rows:
+                    if isinstance(row, dict):
+                        existing.add(row.get("name") or row.get(1))
+                    else:
+                        # tuple-like: (cid, name, type, notnull, dflt, pk)
+                        try:
+                            existing.add(row[1])
+                        except Exception:
+                            pass
+                existing.discard(None)
+
+            for col, ddl in _V12_COLUMNS:
+                if col in existing:
+                    continue
+                # PG-safe: ALTER TABLE … ADD COLUMN IF NOT EXISTS
+                if backend_name == "postgres":
+                    sql = (f"ALTER TABLE events "
+                           f"ADD COLUMN IF NOT EXISTS {col} {ddl}")
+                else:
+                    sql = f"ALTER TABLE events ADD COLUMN {col} {ddl}"
+                try:
+                    con.execute(sql)
+                    log.info(f"[migration] events.{col} added ({backend_name})")
+                except Exception as e:
+                    # Race condition / duplicate column → fine
+                    log.debug(f"[migration] {col}: {e}")
+
+            # Re-create royal indexes (cheap, idempotent)
+            for ix_sql in _V12_INDEXES:
+                try:
+                    con.execute(ix_sql)
+                except Exception:
+                    pass
+        _MIGRATED = True
+    except Exception as e:
+        log.error(f"[migration] V12 failed: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -201,13 +308,14 @@ def delete_account(account_id: str) -> None:
 def upsert_event(slug: str, data: dict[str, Any]) -> bool:
     """Returns True if this is a brand-new slug we hadn't seen before.
 
-    V11: also stores royal_category, end_date, has_availability,
-    sub_title and venue so the bot UI can filter intelligently without
-    re-parsing tickets_json on every call.
+    V12: stores royal_category, end_date, has_availability,
+    sub_title and venue alongside the legacy columns.
+
+    V12 also auto-deletes any DB row whose end_date is in the past
+    (silent housekeeping) so the public listing stays clean.
     """
     now = time.time()
-    # V11 schema migration safeguard — add columns if upgrading from v10.
-    _ensure_event_v11_columns()
+    _ensure_event_v12_columns()
     with _conn() as con:
         cur = con.execute("SELECT 1 FROM events WHERE slug = ?", (slug,)).fetchone()
         is_new = cur is None
@@ -253,32 +361,32 @@ def upsert_event(slug: str, data: dict[str, Any]) -> bool:
         return is_new
 
 
-def _ensure_event_v11_columns() -> None:
-    """Idempotent migration: adds V11 columns to a pre-V11 events table.
+def purge_ended_events(grace_seconds: int = 3600) -> int:
+    """V12 dynamic cleanup — delete rows whose end_date passed.
 
-    Older deployments don't have royal_category/end_date/has_availability
-    yet — this lets the bot keep running after `git pull` without forcing
-    the operator to drop the database.
+    Returns the number of rows deleted. Safe to call repeatedly.
     """
-    needed = [
-        ("royal_category", "TEXT"),
-        ("end_date", "INTEGER DEFAULT 0"),
-        ("has_availability", "INTEGER DEFAULT 1"),
-        ("sub_title", "TEXT"),
-        ("venue", "TEXT"),
-    ]
+    _ensure_event_v12_columns()
+    cutoff = time.time() - grace_seconds
+    deleted = 0
     try:
         with _conn() as con:
-            cur = con.execute("PRAGMA table_info(events)")
-            existing = {row[1] for row in cur.fetchall()}
-            for col, ddl in needed:
-                if col not in existing:
-                    try:
-                        con.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+            cur = con.execute(
+                "DELETE FROM events "
+                "WHERE end_date IS NOT NULL "
+                "  AND end_date > 0 "
+                "  AND end_date < ?",
+                (cutoff,),
+            )
+            try:
+                deleted = int(getattr(cur, "rowcount", 0) or 0)
+            except Exception:
+                deleted = 0
+    except Exception as e:
+        log.debug(f"purge_ended_events: {e}")
+    if deleted:
+        log.info(f"🧹 purged {deleted} ended events")
+    return deleted
 
 
 def get_event(slug: str) -> Optional[dict[str, Any]]:
@@ -299,25 +407,20 @@ def list_recent_events(limit: int = 200,
                        royal_category: Optional[str] = None,
                        only_available: bool = True,
                        hide_ended: bool = True) -> list[dict[str, Any]]:
-    """V11 royal listing.
+    """V12 royal listing.
 
-    Returns events sorted by:
-      1) first_seen_at DESC  — brand-new events bubble to the top
-      2) start_date    ASC   — then earliest upcoming events first
-
-    Filters applied:
-      • hide_ended=True       — drop events whose end_date < now (-1h grace).
-      • only_available=True   — drop sold_out events (has_availability=0).
-      • royal_category=...    — keep only events of that royal category.
+    Returns events sorted newest-first (first_seen_at DESC, then earliest
+    upcoming start_date). Filters:
+      • hide_ended=True       — drop events whose end_date < now (-1h grace)
+      • only_available=True   — drop sold-out events (has_availability=0)
+      • royal_category=...    — keep only the given royal category key
     """
-    _ensure_event_v11_columns()
+    _ensure_event_v12_columns()
     where = []
     params: list[Any] = []
 
     if hide_ended:
         now = time.time()
-        # Allow events with no end_date stored (legacy rows) OR end_date in future
-        # OR start_date in future (events that haven't started yet)
         where.append(
             "(end_date IS NULL OR end_date = 0 OR end_date > ? "
             " OR (start_date IS NOT NULL AND start_date > ?))"
@@ -334,7 +437,6 @@ def list_recent_events(limit: int = 200,
     sql = "SELECT * FROM events"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    # "newest first" = first_seen_at desc, then earliest upcoming start_date
     sql += (
         " ORDER BY first_seen_at DESC,"
         " CASE WHEN start_date IS NULL OR start_date = 0 THEN 9999999999"
@@ -351,12 +453,8 @@ def list_recent_events(limit: int = 200,
 def count_events_by_royal_category(only_available: bool = True,
                                     hide_ended: bool = True
                                     ) -> dict[str, int]:
-    """V11: live counter for the royal category menu.
-
-    Returns {'sports': 12, 'theater': 4, 'concerts': 28} so each
-    button on the home menu can show its real count.
-    """
-    _ensure_event_v11_columns()
+    """V12: live counter for the royal category menu (5 sections)."""
+    _ensure_event_v12_columns()
     where = []
     params: list[Any] = []
     if hide_ended:
@@ -374,7 +472,8 @@ def count_events_by_royal_category(only_available: bool = True,
         sql += " WHERE " + " AND ".join(where)
     sql += " GROUP BY royal_category"
 
-    out = {"sports": 0, "theater": 0, "concerts": 0}
+    out = {"sports": 0, "concerts": 0, "theater": 0,
+           "experiences": 0, "exhibitions": 0}
     try:
         with _conn() as con:
             for r in con.execute(sql, tuple(params)).fetchall():
@@ -383,8 +482,8 @@ def count_events_by_royal_category(only_available: bool = True,
                 cnt = (r["c"] if isinstance(r, dict) else r[1]) or 0
                 if key in out:
                     out[key] = int(cnt)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"count_events_by_royal_category: {e}")
     return out
 
 
@@ -431,8 +530,7 @@ def list_bookings(chat_id: Optional[str] = None,
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Drop watchers (replaces old sniper system — fires on actual seat drops,
-# not on speed-based polling)
+# Drop watchers
 # ════════════════════════════════════════════════════════════════════════
 def add_drop_watcher(*, chat_id: str, account_id: str, event_slug: str,
                     event_key: str, ticket_type_id: str, quantity: int,
@@ -490,7 +588,7 @@ def cancel_drop_watchers(chat_id: str) -> int:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Bot settings (runtime-tunable via /admin UI)
+# Bot settings
 # ════════════════════════════════════════════════════════════════════════
 def set_bot_setting(key: str, value: str, updated_by: str = "admin") -> None:
     with _conn() as con:
@@ -519,7 +617,7 @@ def list_bot_settings() -> dict[str, str]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Event blocks selection (user picks primary + backup blocks)
+# Event blocks selection
 # ════════════════════════════════════════════════════════════════════════
 def save_event_blocks(*, chat_id: str, event_slug: str, ticket_type_id: str,
                      primary_block: str, backup_blocks: list[str],
@@ -552,7 +650,7 @@ def get_event_blocks(blocks_id: int) -> Optional[dict[str, Any]]:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Seat maps cache (reusable across booking sessions)
+# Seat maps cache
 # ════════════════════════════════════════════════════════════════════════
 def save_seat_map(*, chart_key: str, event_key: str, rendering_info: dict,
                  blocks_meta: list[dict]) -> None:
@@ -588,6 +686,10 @@ def get_seat_map(chart_key: str, max_age: float = 86400) -> Optional[dict[str, A
         except Exception:
             pass
         return d
+
+
+# Backwards-compat alias for any caller still referencing the V11 helper.
+_ensure_event_v11_columns = _ensure_event_v12_columns
 
 
 # Initialize on import so any module that imports us gets a ready DB

@@ -1,15 +1,17 @@
 """
 Database connection layer supporting PostgreSQL (primary), Turso, or local SQLite.
 
+V12 Royal — Hardened against multi-statement script issues:
+  • executescript now splits the script and runs each statement INDIVIDUALLY
+    on PostgreSQL (psycopg2 stops at first error in a transaction otherwise).
+  • Each ALTER TABLE / CREATE INDEX is wrapped so a failure on one does not
+    poison the entire transaction.
+  • _translate_for_pg now also handles BIGINT defaults and DEFAULT values.
+
 Priority:
   1. DATABASE_URL or POSTGRES_URL  → PostgreSQL (via psycopg2)  ← persistent
   2. TURSO_DATABASE_URL + TURSO_AUTH_TOKEN → Turso cloud SQLite  ← persistent
   3. Fallback → local sqlite3 file                             ← ephemeral
-
-SQL dialect notes:
-  • `?` placeholders → `%s` (Postgres)
-  • `AUTOINCREMENT`  → `BIGSERIAL`
-  • `INSERT OR IGNORE` → `INSERT … ON CONFLICT DO NOTHING`
 """
 from __future__ import annotations
 
@@ -71,27 +73,59 @@ if _pg_pool is None and TURSO_URL and TURSO_TOKEN:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# SQL dialect translator
+# SQL dialect translator (sqlite → postgres)
 # ════════════════════════════════════════════════════════════════════════
 def _translate_for_pg(sql: str) -> str:
     s = sql
     s = s.replace("?", "%s")
-    s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", s, flags=re.I)
+    s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+               "BIGSERIAL PRIMARY KEY", s, flags=re.I)
     s = re.sub(r"\bINSERT\s+OR\s+IGNORE\b\s+INTO", "INSERT INTO", s, flags=re.I)
-    # INSERT OR IGNORE: we'll append ON CONFLICT DO NOTHING below for inserts
-    # but keep original behavior — most inserts use ON CONFLICT explicitly
     s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s, flags=re.I)
     s = re.sub(r"\bBLOB\b", "BYTEA", s, flags=re.I)
     return s
 
 
 # ════════════════════════════════════════════════════════════════════════
-# PostgreSQL wrapper (fixed: lastrowid only for tables that have 'id' SERIAL)
+# Multi-statement splitter — used by executescript on PG
+# ════════════════════════════════════════════════════════════════════════
+def _split_sql(script: str) -> list[str]:
+    """Split a multi-statement SQL script on semicolons (top-level only).
+
+    Strips SQL comments. Keeps each statement standalone so psycopg2 can
+    execute them one by one (avoids 'cannot execute multiple commands' on
+    some PG versions and lets us isolate errors per statement).
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    for raw in script.splitlines():
+        line = raw
+        # strip standalone -- comments
+        comment = line.find("--")
+        if comment >= 0:
+            line = line[:comment]
+        if not line.strip():
+            if buf:
+                buf.append("")  # preserve break
+            continue
+        buf.append(line)
+        if line.rstrip().endswith(";"):
+            stmt = "\n".join(buf).strip().rstrip(";").strip()
+            if stmt:
+                out.append(stmt)
+            buf = []
+    leftover = "\n".join(buf).strip().rstrip(";").strip()
+    if leftover:
+        out.append(leftover)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════
+# PostgreSQL wrapper
 # ════════════════════════════════════════════════════════════════════════
 class _PgCursorWrapper:
     """Wraps psycopg2 cursor and exposes sqlite-like API."""
 
-    # Tables with BIGSERIAL 'id' column — only these need lastrowid.
     _ID_TABLES = {"bookings", "event_blocks", "drop_watchers"}
 
     def __init__(self, cur, pg_conn, stmt: str):
@@ -100,24 +134,28 @@ class _PgCursorWrapper:
         self._stmt = stmt
         self.lastrowid: Optional[int] = None
 
-        # Only try to fetch lastrowid for INSERT statements on tables
-        # that have an 'id' serial column. Running currval() on a table
-        # that doesn't have that sequence raises, which would poison the
-        # transaction (rolling back the INSERT!).
         m = re.search(r"INSERT\s+INTO\s+(\w+)", stmt, re.I)
         if m and m.group(1).lower() in self._ID_TABLES and "returning" not in stmt.lower():
             tbl = m.group(1).lower()
             try:
                 c2 = self._conn.cursor()
-                c2.execute("SELECT currval(pg_get_serial_sequence(%s, 'id')) AS v", (tbl,))
+                c2.execute(
+                    "SELECT currval(pg_get_serial_sequence(%s, 'id')) AS v",
+                    (tbl,),
+                )
                 r = c2.fetchone()
                 if r:
                     val = r["v"] if isinstance(r, dict) else r[0]
                     self.lastrowid = int(val) if val is not None else None
                 c2.close()
             except Exception:
-                # Ignore — not fatal (e.g. first insert on empty table).
                 pass
+
+        # rowcount passthrough
+        try:
+            self.rowcount = self._cur.rowcount
+        except Exception:
+            self.rowcount = -1
 
     def fetchone(self):
         try:
@@ -147,18 +185,31 @@ class _PgConn:
         try:
             cur.execute(sql_pg, tuple(params) if params else ())
         except Exception as e:
-            log.error(f"[db] execute err on: {sql_pg[:120]} | {e}")
+            log.error(f"[db] execute err on: {sql_pg[:140]} | {e}")
             raise
         return _PgCursorWrapper(cur, self._conn, sql_pg)
 
     def executescript(self, script: str):
-        cur = self._conn.cursor()
-        # psycopg2 supports multi-statement scripts when autocommit off.
-        try:
-            cur.execute(_translate_for_pg(script))
-        except Exception as e:
-            log.error(f"[db] executescript err: {e}")
-            raise
+        """V12: split into individual statements, run each in its own
+        savepoint so a failure on one ALTER/INDEX does not abort the rest.
+        """
+        stmts = _split_sql(_translate_for_pg(script))
+        for stmt in stmts:
+            if not stmt.strip():
+                continue
+            cur = self._conn.cursor()
+            try:
+                # savepoint per stmt → isolates errors (e.g. duplicate column)
+                cur.execute("SAVEPOINT _stmt_sp")
+                cur.execute(stmt)
+                cur.execute("RELEASE SAVEPOINT _stmt_sp")
+            except Exception as e:
+                # rollback ONLY this savepoint, keep the rest of the tx alive
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT _stmt_sp")
+                except Exception:
+                    pass
+                log.warning(f"[db] script stmt skipped: {stmt[:80]} | {e}")
 
     def commit(self):
         try:
@@ -195,6 +246,7 @@ class _TursoCursor:
     def __init__(self, rs):
         self._rs = rs
         self.lastrowid = getattr(rs, "last_insert_rowid", None)
+        self.rowcount = getattr(rs, "rows_affected", -1)
         self._cols = list(getattr(rs, "columns", []) or [])
         self._rows = [_TursoRow(self._cols, list(r)) for r in (rs.rows or [])]
         self._i = 0
@@ -226,30 +278,19 @@ class _TursoConn:
     def executescript(self, script: str):
         for stmt in _split_sql(script):
             if stmt.strip():
-                self._c.execute(stmt)
+                try:
+                    self._c.execute(stmt)
+                except Exception as e:
+                    log.warning(f"[db turso] script stmt skipped: {e}")
 
     def commit(self):
         pass
 
-    def close(self):
+    def rollback(self):
         pass
 
-
-def _split_sql(script: str) -> list[str]:
-    out = []
-    buf = []
-    for line in script.splitlines():
-        if line.strip().startswith("--"):
-            continue
-        buf.append(line)
-        if line.rstrip().endswith(";"):
-            out.append("\n".join(buf).rstrip().rstrip(";"))
-            buf = []
-    if buf:
-        leftover = "\n".join(buf).strip()
-        if leftover:
-            out.append(leftover)
-    return out
+    def close(self):
+        pass
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -341,7 +382,6 @@ def list_tables() -> list[str]:
 
 def query_table(table: str, limit: int = 100) -> tuple[list[str], list[list]]:
     """Return (columns, rows) for a table. Read-only."""
-    # Guard against SQL injection: only allow known table names
     allowed = set(list_tables())
     if table not in allowed:
         return [], []
@@ -400,7 +440,6 @@ def delete_row(table: str, where_col: str, where_val: Any) -> bool:
     allowed = set(list_tables())
     if table not in allowed:
         return False
-    # Only simple column names
     if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", where_col):
         return False
 

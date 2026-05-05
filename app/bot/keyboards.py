@@ -1,5 +1,12 @@
 """Inline keyboard builders. All callback_data strings are ≤ 64 bytes.
 
+V12 Royal UI — five categories that mirror the live webook.com top-nav:
+  ⚽️ الرياضة والمباريات   (sports)
+  🎤 الموسيقى والحفلات    (concerts)
+  🎭 المسرح والفنون        (theater)
+  🎡 الترفيه والتجارب      (experiences)
+  🖼 المعارض والمتاحف      (exhibitions)
+
 Long identifiers (slug, ObjectId) are stored via app.bot.tokens so the
 callback_data carries only an 8-char opaque token.
 """
@@ -10,8 +17,21 @@ from typing import Any
 from app.bot import tokens as tok
 
 
+# ════════════════════════════════════════════════════════════════════════
+# V12 royal category meta (single source of truth for the keyboards)
+# ════════════════════════════════════════════════════════════════════════
+ROYAL_NAV: tuple[tuple[str, str, str], ...] = (
+    # (key, emoji, arabic-label)
+    ("sports",      "⚽️", "الرياضة والمباريات"),
+    ("concerts",    "🎤", "الموسيقى والحفلات"),
+    ("theater",     "🎭", "المسرح والفنون"),
+    ("experiences", "🎡", "الترفيه والتجارب"),
+    ("exhibitions", "🖼",  "المعارض والمتاحف"),
+)
+
+
 def main_menu() -> dict[str, Any]:
-    """V11 Royal main menu — luxurious gateway to the booking engine."""
+    """V12 Royal main menu — luxurious gateway to the booking engine."""
     return {"inline_keyboard": [
         [{"text": "👑 بوابة الفعاليات الملكية",
           "callback_data": "cats:menu"}],
@@ -25,44 +45,40 @@ def main_menu() -> dict[str, Any]:
 
 def royal_categories_menu(counts: dict[str, int] | None = None
                           ) -> dict[str, Any]:
-    """V11: Inline royal-category picker.
+    """V12: Five-section royal-category picker.
 
-    `counts` (optional) is a {category_key: live_count} dict; when
-    provided, each button shows the live count of available events.
+    `counts` is a {category_key: live_count} dict; when provided each
+    button shows the live count of available events as a 💎 badge.
     """
     counts = counts or {}
-    sport_n = counts.get("sports", 0)
-    theater_n = counts.get("theater", 0)
-    concert_n = counts.get("concerts", 0)
 
     def _label(emoji: str, ar: str, n: int) -> str:
-        return f"{emoji}  {ar}  •  {n} ✨" if n > 0 else f"{emoji}  {ar}"
+        if n > 0:
+            return f"{emoji}  {ar}  •  {n} 💎"
+        return f"{emoji}  {ar}"
 
-    return {"inline_keyboard": [
-        [{"text": _label("⚽️", "الرياضة والمباريات", sport_n),
-          "callback_data": "cat:sports:0"}],
-        [{"text": _label("🎭", "المسرح والعروض", theater_n),
-          "callback_data": "cat:theater:0"}],
-        [{"text": _label("🎤", "الحفلات والترفيه", concert_n),
-          "callback_data": "cat:concerts:0"}],
-        [{"text": "✨  عرض جميع الفعاليات المتاحة",
-          "callback_data": "cat:all:0"}],
-        [{"text": "🔄 تحديث القائمة",
-          "callback_data": "cats:refresh"}],
-        [{"text": "🔙 العودة للقائمة الرئيسية",
-          "callback_data": "menu"}],
-    ]}
+    rows = []
+    for key, emoji, ar in ROYAL_NAV:
+        rows.append([{
+            "text": _label(emoji, ar, counts.get(key, 0)),
+            "callback_data": f"cat:{key}:0",
+        }])
+    rows.append([{"text": "✨  جميع الفعاليات المتاحة",
+                  "callback_data": "cat:all:0"}])
+    rows.append([{"text": "🔄 تحديث القائمة",
+                  "callback_data": "cats:refresh"}])
+    rows.append([{"text": "🔙 العودة للقائمة الرئيسية",
+                  "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
 
 
 def events_keyboard(events: list[dict], page: int = 0,
                     page_size: int = 8,
                     category_key: str = "") -> dict[str, Any]:
-    """V11 royal events list.
+    """V12 royal events list.
 
-    • each row: status emoji 🟢/🟡 + truncated title
-    • nav row: ⏮️ / ⏭️ buttons
-    • refresh row: 🔄 تحديث القائمة
-    • footer: 🔙 العودة للتصنيفات
+    Each row: status-dot + truncated title.
+      🟢 متاح بمقاعد  |  🟡 متاح بدون خريطة  |  🔴 نفد  (hidden anyway)
     """
     start = page * page_size
     chunk = events[start:start + page_size]
@@ -70,13 +86,12 @@ def events_keyboard(events: list[dict], page: int = 0,
     for e in chunk:
         t = tok.put({"slug": e["slug"]})
         avail = e.get("has_availability", 1)
-        # 🟢 plenty   |  🟡 limited (sub-title hint of subscription)  | 🔴 sold-out
         if not avail:
             dot = "🔴"
         elif e.get("is_seated"):
             dot = "🟢"
         else:
-            dot = "⚫"
+            dot = "🟡"
         title = _truncate(e.get("title") or e.get("slug") or "—", 46)
         rows.append([{"text": f"{dot} {title}",
                       "callback_data": f"evt:{t}"}])
@@ -106,15 +121,16 @@ def ticket_types_keyboard(event_slug: str,
     for t in tickets:
         if t.get("status") != "active":
             continue
+        # V12: hide sold_out / ended tickets from the front face entirely.
+        sale = (t.get("sale_status") or "").lower()
+        if sale in ("ended", "sold_out", "soldout"):
+            continue
         any_active = True
-        status = t.get("sale_status") or ""
         badge = ""
-        if status == "ongoing":
+        if sale == "ongoing":
             badge = " ✅"
-        elif status == "not_yet":
+        elif sale == "not_yet":
             badge = " ⏳"
-        elif status == "ended":
-            badge = " ⛔"
         price = t.get("display_price") or 0
         ccy = _ccy(t.get("currency") or "SAR")
         price_lbl = f"{_fmt_price(price)} {ccy}" if price else "—"
@@ -137,22 +153,14 @@ def blocks_picker_keyboard(blocks: list[dict], session_token: str,
                             backups: list[str] | None = None,
                             mode: str = "primary",
                             webapp_url: str = "") -> dict[str, Any]:
-    """Block picker for seats.io.
-
-    blocks: [{"name": "S1", "free": 12, "total": 50}, ...]
-            (free/total may be -1 when unknown via API)
-    mode:   'primary'  → tap one block to set as PRIMARY
-            'backup'   → tap blocks to add/remove as backup (toggle)
-    webapp_url: optional Telegram WebApp URL for visual seat picking.
-    """
     backups = backups or []
     rows = []
-    for b in blocks[:30]:  # cap to keep callback area sane
+    for b in blocks[:30]:
         name = b.get("name", "")
         free = b.get("free", 0)
         total = b.get("total", 0)
         if free < 0 or total < 0:
-            full = "⚪"  # unknown availability
+            full = "⚪"
             counts = ""
         else:
             full = "🔴" if free == 0 else ("🟢" if free > 5 else "🟡")
