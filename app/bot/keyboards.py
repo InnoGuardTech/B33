@@ -11,8 +11,10 @@ from app.bot import tokens as tok
 
 
 def main_menu() -> dict[str, Any]:
+    """V11 Royal main menu — luxurious gateway to the booking engine."""
     return {"inline_keyboard": [
-        [{"text": "🎫 الفعاليات الجارية", "callback_data": "events:0"}],
+        [{"text": "👑 بوابة الفعاليات الملكية",
+          "callback_data": "cats:menu"}],
         [{"text": "🔗 إرسال رابط فعالية", "callback_data": "link:prompt"}],
         [{"text": "👥 إدارة الحسابات", "callback_data": "accounts:list"}],
         [{"text": "📋 حجوزاتي", "callback_data": "bookings:list"}],
@@ -21,26 +23,79 @@ def main_menu() -> dict[str, Any]:
     ]}
 
 
+def royal_categories_menu(counts: dict[str, int] | None = None
+                          ) -> dict[str, Any]:
+    """V11: Inline royal-category picker.
+
+    `counts` (optional) is a {category_key: live_count} dict; when
+    provided, each button shows the live count of available events.
+    """
+    counts = counts or {}
+    sport_n = counts.get("sports", 0)
+    theater_n = counts.get("theater", 0)
+    concert_n = counts.get("concerts", 0)
+
+    def _label(emoji: str, ar: str, n: int) -> str:
+        return f"{emoji}  {ar}  •  {n} ✨" if n > 0 else f"{emoji}  {ar}"
+
+    return {"inline_keyboard": [
+        [{"text": _label("⚽️", "الرياضة والمباريات", sport_n),
+          "callback_data": "cat:sports:0"}],
+        [{"text": _label("🎭", "المسرح والعروض", theater_n),
+          "callback_data": "cat:theater:0"}],
+        [{"text": _label("🎤", "الحفلات والترفيه", concert_n),
+          "callback_data": "cat:concerts:0"}],
+        [{"text": "✨  عرض جميع الفعاليات المتاحة",
+          "callback_data": "cat:all:0"}],
+        [{"text": "🔄 تحديث القائمة",
+          "callback_data": "cats:refresh"}],
+        [{"text": "🔙 العودة للقائمة الرئيسية",
+          "callback_data": "menu"}],
+    ]}
+
+
 def events_keyboard(events: list[dict], page: int = 0,
-                    page_size: int = 8) -> dict[str, Any]:
+                    page_size: int = 8,
+                    category_key: str = "") -> dict[str, Any]:
+    """V11 royal events list.
+
+    • each row: status emoji 🟢/🟡 + truncated title
+    • nav row: ⏮️ / ⏭️ buttons
+    • refresh row: 🔄 تحديث القائمة
+    • footer: 🔙 العودة للتصنيفات
+    """
     start = page * page_size
     chunk = events[start:start + page_size]
     rows = []
     for e in chunk:
         t = tok.put({"slug": e["slug"]})
-        rows.append([{"text": f"• {_truncate(e['title'] or e['slug'], 50)}",
+        avail = e.get("has_availability", 1)
+        # 🟢 plenty   |  🟡 limited (sub-title hint of subscription)  | 🔴 sold-out
+        if not avail:
+            dot = "🔴"
+        elif e.get("is_seated"):
+            dot = "🟢"
+        else:
+            dot = "⚫"
+        title = _truncate(e.get("title") or e.get("slug") or "—", 46)
+        rows.append([{"text": f"{dot} {title}",
                       "callback_data": f"evt:{t}"}])
     nav = []
+    cat_arg = category_key or "all"
     if page > 0:
-        nav.append({"text": "◀️ السابق",
-                    "callback_data": f"events:{page-1}"})
+        nav.append({"text": "⏮️ السابق",
+                    "callback_data": f"cat:{cat_arg}:{page-1}"})
     if start + page_size < len(events):
-        nav.append({"text": "التالي ▶️",
-                    "callback_data": f"events:{page+1}"})
+        nav.append({"text": "التالي ⏭️",
+                    "callback_data": f"cat:{cat_arg}:{page+1}"})
     if nav:
         rows.append(nav)
-    rows.append([{"text": "🔄 تحديث", "callback_data": "events:refresh"}])
-    rows.append([{"text": "⬅️ القائمة الرئيسية", "callback_data": "menu"}])
+    rows.append([{"text": "🔄 تحديث القائمة",
+                  "callback_data": f"cat:{cat_arg}:refresh"}])
+    rows.append([{"text": "🔙 العودة للتصنيفات",
+                  "callback_data": "cats:menu"}])
+    rows.append([{"text": "🏠 القائمة الرئيسية",
+                  "callback_data": "menu"}])
     return {"inline_keyboard": rows}
 
 
@@ -71,8 +126,9 @@ def ticket_types_keyboard(event_slug: str,
         rows.append([{"text": "⚠️ لا توجد تذاكر متاحة",
                       "callback_data": "menu"}])
 
-    rows.append([{"text": "⬅️ رجوع للفعاليات",
-                  "callback_data": "events:0"}])
+    rows.append([{"text": "🔙 العودة للتصنيفات",
+                  "callback_data": "cats:menu"}])
+    rows.append([{"text": "🏠 القائمة الرئيسية", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
 
 

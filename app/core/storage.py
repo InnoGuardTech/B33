@@ -39,18 +39,23 @@ def init_db() -> None:
         );
 
         CREATE TABLE IF NOT EXISTS events (
-            slug            TEXT PRIMARY KEY,
-            title           TEXT,
-            category        TEXT,
-            city            TEXT,
-            url             TEXT,
-            start_date      INTEGER,
-            is_seated       INTEGER DEFAULT 0,
-            poster          TEXT,
-            tickets_json    TEXT,
-            first_seen_at   REAL,
-            last_seen_at    REAL,
-            last_checked_at REAL
+            slug             TEXT PRIMARY KEY,
+            title            TEXT,
+            category         TEXT,
+            royal_category   TEXT,
+            city             TEXT,
+            url              TEXT,
+            start_date       INTEGER,
+            end_date         INTEGER DEFAULT 0,
+            is_seated        INTEGER DEFAULT 0,
+            has_availability INTEGER DEFAULT 1,
+            sub_title        TEXT,
+            venue            TEXT,
+            poster           TEXT,
+            tickets_json     TEXT,
+            first_seen_at    REAL,
+            last_seen_at     REAL,
+            last_checked_at  REAL
         );
 
         CREATE TABLE IF NOT EXISTS bookings (
@@ -112,6 +117,9 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_events_last_seen   ON events(last_seen_at);
         CREATE INDEX IF NOT EXISTS idx_events_start_date  ON events(start_date);
+        CREATE INDEX IF NOT EXISTS idx_events_first_seen  ON events(first_seen_at);
+        CREATE INDEX IF NOT EXISTS idx_events_royal_cat   ON events(royal_category);
+        CREATE INDEX IF NOT EXISTS idx_events_avail       ON events(has_availability);
         CREATE INDEX IF NOT EXISTS idx_accounts_status    ON accounts(status);
         CREATE INDEX IF NOT EXISTS idx_dropwatch_status   ON drop_watchers(status);
         CREATE INDEX IF NOT EXISTS idx_blocks_chat        ON event_blocks(chat_id);
@@ -191,23 +199,36 @@ def delete_account(account_id: str) -> None:
 # Events
 # ════════════════════════════════════════════════════════════════════════
 def upsert_event(slug: str, data: dict[str, Any]) -> bool:
-    """Returns True if this is a brand-new slug we hadn't seen before."""
+    """Returns True if this is a brand-new slug we hadn't seen before.
+
+    V11: also stores royal_category, end_date, has_availability,
+    sub_title and venue so the bot UI can filter intelligently without
+    re-parsing tickets_json on every call.
+    """
     now = time.time()
+    # V11 schema migration safeguard — add columns if upgrading from v10.
+    _ensure_event_v11_columns()
     with _conn() as con:
         cur = con.execute("SELECT 1 FROM events WHERE slug = ?", (slug,)).fetchone()
         is_new = cur is None
         con.execute("""
-            INSERT INTO events (slug, title, category, city, url, start_date,
-                                is_seated, poster, tickets_json,
+            INSERT INTO events (slug, title, category, royal_category, city, url,
+                                start_date, end_date, is_seated, has_availability,
+                                sub_title, venue, poster, tickets_json,
                                 first_seen_at, last_seen_at, last_checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(slug) DO UPDATE SET
               title = excluded.title,
               category = excluded.category,
+              royal_category = excluded.royal_category,
               city = excluded.city,
               url = excluded.url,
               start_date = excluded.start_date,
+              end_date = excluded.end_date,
               is_seated = excluded.is_seated,
+              has_availability = excluded.has_availability,
+              sub_title = excluded.sub_title,
+              venue = excluded.venue,
               poster = excluded.poster,
               tickets_json = excluded.tickets_json,
               last_seen_at = excluded.last_seen_at,
@@ -216,15 +237,48 @@ def upsert_event(slug: str, data: dict[str, Any]) -> bool:
             slug,
             data.get("title"),
             data.get("category"),
+            data.get("royal_category"),
             data.get("city"),
             data.get("url"),
             data.get("start_date"),
+            data.get("end_date") or 0,
             1 if data.get("is_seated") else 0,
+            1 if data.get("has_availability", True) else 0,
+            data.get("sub_title") or "",
+            data.get("venue") or "",
             data.get("poster"),
             json.dumps(data.get("tickets") or [], ensure_ascii=False),
             now, now, now,
         ))
         return is_new
+
+
+def _ensure_event_v11_columns() -> None:
+    """Idempotent migration: adds V11 columns to a pre-V11 events table.
+
+    Older deployments don't have royal_category/end_date/has_availability
+    yet — this lets the bot keep running after `git pull` without forcing
+    the operator to drop the database.
+    """
+    needed = [
+        ("royal_category", "TEXT"),
+        ("end_date", "INTEGER DEFAULT 0"),
+        ("has_availability", "INTEGER DEFAULT 1"),
+        ("sub_title", "TEXT"),
+        ("venue", "TEXT"),
+    ]
+    try:
+        with _conn() as con:
+            cur = con.execute("PRAGMA table_info(events)")
+            existing = {row[1] for row in cur.fetchall()}
+            for col, ddl in needed:
+                if col not in existing:
+                    try:
+                        con.execute(f"ALTER TABLE events ADD COLUMN {col} {ddl}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
 
 
 def get_event(slug: str) -> Optional[dict[str, Any]]:
@@ -241,13 +295,97 @@ def get_event(slug: str) -> Optional[dict[str, Any]]:
         return d
 
 
-def list_recent_events(limit: int = 20) -> list[dict[str, Any]]:
+def list_recent_events(limit: int = 200,
+                       royal_category: Optional[str] = None,
+                       only_available: bool = True,
+                       hide_ended: bool = True) -> list[dict[str, Any]]:
+    """V11 royal listing.
+
+    Returns events sorted by:
+      1) first_seen_at DESC  — brand-new events bubble to the top
+      2) start_date    ASC   — then earliest upcoming events first
+
+    Filters applied:
+      • hide_ended=True       — drop events whose end_date < now (-1h grace).
+      • only_available=True   — drop sold_out events (has_availability=0).
+      • royal_category=...    — keep only events of that royal category.
+    """
+    _ensure_event_v11_columns()
+    where = []
+    params: list[Any] = []
+
+    if hide_ended:
+        now = time.time()
+        # Allow events with no end_date stored (legacy rows) OR end_date in future
+        # OR start_date in future (events that haven't started yet)
+        where.append(
+            "(end_date IS NULL OR end_date = 0 OR end_date > ? "
+            " OR (start_date IS NOT NULL AND start_date > ?))"
+        )
+        params.extend([now - 3600, now - 6 * 3600])
+
+    if only_available:
+        where.append("(has_availability IS NULL OR has_availability = 1)")
+
+    if royal_category:
+        where.append("royal_category = ?")
+        params.append(royal_category)
+
+    sql = "SELECT * FROM events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    # "newest first" = first_seen_at desc, then earliest upcoming start_date
+    sql += (
+        " ORDER BY first_seen_at DESC,"
+        " CASE WHEN start_date IS NULL OR start_date = 0 THEN 9999999999"
+        "      ELSE start_date END ASC"
+        " LIMIT ?"
+    )
+    params.append(limit)
+
     with _conn() as con:
-        rows = con.execute(
-            "SELECT * FROM events ORDER BY last_seen_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = con.execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in rows]
+
+
+def count_events_by_royal_category(only_available: bool = True,
+                                    hide_ended: bool = True
+                                    ) -> dict[str, int]:
+    """V11: live counter for the royal category menu.
+
+    Returns {'sports': 12, 'theater': 4, 'concerts': 28} so each
+    button on the home menu can show its real count.
+    """
+    _ensure_event_v11_columns()
+    where = []
+    params: list[Any] = []
+    if hide_ended:
+        now = time.time()
+        where.append(
+            "(end_date IS NULL OR end_date = 0 OR end_date > ? "
+            " OR (start_date IS NOT NULL AND start_date > ?))"
+        )
+        params.extend([now - 3600, now - 6 * 3600])
+    if only_available:
+        where.append("(has_availability IS NULL OR has_availability = 1)")
+
+    sql = "SELECT royal_category, COUNT(*) AS c FROM events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " GROUP BY royal_category"
+
+    out = {"sports": 0, "theater": 0, "concerts": 0}
+    try:
+        with _conn() as con:
+            for r in con.execute(sql, tuple(params)).fetchall():
+                key = (r["royal_category"] if isinstance(r, dict)
+                       else r[0]) or ""
+                cnt = (r["c"] if isinstance(r, dict) else r[1]) or 0
+                if key in out:
+                    out[key] = int(cnt)
+    except Exception:
+        pass
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════

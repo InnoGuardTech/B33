@@ -26,7 +26,7 @@ from app.core.config import authorized_chat_ids, default_payment_method, PUBLIC_
 from app.core.storage import (
     delete_account, get_account, list_accounts, list_bookings,
     list_recent_events, upsert_account, upsert_event, set_bot_setting,
-    get_bot_setting,
+    get_bot_setting, count_events_by_royal_category,
 )
 from app.services import auth_service
 from app.services.block_analyzer import extract_blocks
@@ -41,10 +41,14 @@ from app.services.webook_api import get_event_detail, get_event_tickets
 log = logging.getLogger("handlers")
 
 WELCOME = (
-    "👋 <b>أهلاً بك في بوت Webook</b>\n\n"
-    "أرسل رابط فعالية ↗️ أو اختر من قائمة الفعاليات.\n"
-    "البوت يتعامل مباشرةً مع خرائط seats.io ويحجز مقاعد متجاورة بذكاء.\n\n"
-    "اختر من القائمة:"
+    "👑  <b>بوابة Webook الملكية</b>  ⛜️\n"
+    "════════════════════════\n"
+    "أهلاً بك في أرقى بوابة حجز للفعاليات داخل المملكة.\n\n"
+    "⛜️ حجز فوري للمباريات والحفلات والمسارح.\n"
+    "⛜️ محرّك حجز متوازٍ عبر حسابات متعدّدة.\n"
+    "⛜️ تجاوز ملكيّ لحماية Cloudflare تلقائيّاً.\n\n"
+    "════════════════════════\n"
+    "👑 <b>اختر مسارك:</b>"
 )
 
 HELP = (
@@ -254,7 +258,24 @@ async def _route(chat_id: str, msg_id: int, data: str,
             reply_markup=kb.settings_keyboard(method),
         ); return
 
-    # Events list
+    # V11: Royal categories menu
+    if data == "cats:menu":
+        await _show_categories_menu(chat_id, msg_id, notifier); return
+    if data == "cats:refresh":
+        await _show_categories_menu(chat_id, msg_id, notifier,
+                                     force_refresh=True); return
+
+    # V11: Royal category browse  — cat:<key>:<page|refresh>
+    if data.startswith("cat:"):
+        parts = data.split(":", 2)
+        if len(parts) >= 3:
+            cat_key = parts[1]
+            arg = parts[2]
+            await _show_events_in_category(chat_id, msg_id, cat_key, arg,
+                                            notifier)
+            return
+
+    # Legacy events list (kept for backward compat with old buttons)
     if data.startswith("events:"):
         arg = data.split(":", 1)[1]
         await _show_events(chat_id, msg_id, arg, notifier); return
@@ -592,43 +613,172 @@ def _build_picker_caption(sess: dict) -> str:
 # ════════════════════════════════════════════════════════════════════════
 # Screens
 # ════════════════════════════════════════════════════════════════════════
-async def _show_events(chat_id: str, msg_id: int, arg: str,
-                       notifier: Notifier) -> None:
+# ════════════════════════════════════════════════════════════════════════
+# V11 Royal Categories — luxurious browsing experience
+# ════════════════════════════════════════════════════════════════════════
+ROYAL_CATEGORY_TITLES = {
+    "sports":   ("⚽️", "الرياضة والمباريات"),
+    "theater":  ("🎭", "المسرح والعروض"),
+    "concerts": ("🎤", "الحفلات والترفيه"),
+    "all":      ("✨", "جميع الفعاليات المتاحة"),
+}
+
+
+async def _refresh_events_from_webook() -> int:
+    """Pull fresh events from Webook sitemaps and persist them.
+
+    Returns the count of fresh events persisted.
+    """
+    slugs = await fetch_event_slugs(max_events=240)
+    events = await enrich_all(slugs, concurrency=6)
+    for e in events:
+        upsert_event(e["slug"], e)
+    return len(events)
+
+
+async def _show_categories_menu(chat_id: str, msg_id: int,
+                                 notifier: Notifier,
+                                 force_refresh: bool = False) -> None:
+    """Royal main category gateway."""
+    counts = count_events_by_royal_category(only_available=True,
+                                              hide_ended=True)
+    total_now = sum(counts.values())
+
+    if force_refresh or total_now == 0:
+        await notifier.edit(
+            chat_id, msg_id,
+            "👑  <b>تحديث البوابة الملكيّة</b>\n"
+            "════════════════════════\n"
+            "⏳ جارٍ سحب أحدث الفعاليات وتصفية المنتهية...",
+            reply_markup=None,
+        )
+        try:
+            await _refresh_events_from_webook()
+        except Exception as e:
+            log.warning(f"royal refresh err: {e}")
+        counts = count_events_by_royal_category(only_available=True,
+                                                  hide_ended=True)
+        total_now = sum(counts.values())
+
+    sport_n = counts.get("sports", 0)
+    theater_n = counts.get("theater", 0)
+    concert_n = counts.get("concerts", 0)
+
+    txt = (
+        "👑  <b>البوابة الملكيّة للفعاليات</b>  ⛜️\n"
+        "════════════════════════\n"
+        f"⛜️ <b>إجمالي ما يمكن حجزه الآن:</b> {total_now} فعالية\n\n"
+        f"⚽️ الرياضة والمباريات ـ <b>{sport_n}</b>\n"
+        f"🎭 المسرح والعروض ـ <b>{theater_n}</b>\n"
+        f"🎤 الحفلات والترفيه ـ <b>{concert_n}</b>\n"
+        "════════════════════════\n"
+        "✨ <i>اختر تصنيفاً لتصفح فعالياته المتاحة حصراً.</i>"
+    )
+    await notifier.edit(
+        chat_id, msg_id, txt,
+        reply_markup=kb.royal_categories_menu(counts),
+    )
+
+
+async def _show_events_in_category(chat_id: str, msg_id: int,
+                                     cat_key: str, arg: str,
+                                     notifier: Notifier) -> None:
+    """List events filtered by royal category with luxurious framing."""
+    if cat_key not in ("sports", "theater", "concerts", "all"):
+        cat_key = "all"
+
     if arg == "refresh":
-        await notifier.edit(chat_id, msg_id, "🔄 جارٍ تحديث الفعاليات...",
-                            reply_markup=None)
-        slugs = await fetch_event_slugs(max_events=200)
-        events = await enrich_all(slugs, concurrency=6)
-        for e in events:
-            upsert_event(e["slug"], e)
+        emoji, ar_label = ROYAL_CATEGORY_TITLES.get(cat_key,
+                                                      ("✨", cat_key))
+        await notifier.edit(
+            chat_id, msg_id,
+            f"{emoji}  <b>{ar_label}</b>\n"
+            "════════════════════════\n"
+            "🔄 جارٍ تحديث الفعاليات وتصفية المنتهية...",
+            reply_markup=None,
+        )
+        try:
+            await _refresh_events_from_webook()
+        except Exception as e:
+            log.warning(f"category refresh err: {e}")
         page = 0
     else:
         try:
-            page = int(arg)
-        except ValueError:
+            page = max(0, int(arg))
+        except (TypeError, ValueError):
             page = 0
-        events = list_recent_events(limit=200)
-        if not events:
-            await notifier.edit(chat_id, msg_id,
-                                "🔄 أول تحميل — جارٍ جلب الفعاليات...",
-                                reply_markup=None)
-            slugs = await fetch_event_slugs(max_events=200)
-            events = await enrich_all(slugs, concurrency=6)
-            for e in events:
-                upsert_event(e["slug"], e)
+
+    royal_filter = None if cat_key == "all" else cat_key
+    events = list_recent_events(
+        limit=200, royal_category=royal_filter,
+        only_available=True, hide_ended=True,
+    )
+
+    # First-time empty? auto-pull from webook
+    if not events:
+        await notifier.edit(
+            chat_id, msg_id,
+            "🔄 أول تحميل للبوابة الملكيّة — جارٍ جلب الفعاليات ...",
+            reply_markup=None,
+        )
+        try:
+            await _refresh_events_from_webook()
+        except Exception as e:
+            log.warning(f"first-load refresh err: {e}")
+        events = list_recent_events(
+            limit=200, royal_category=royal_filter,
+            only_available=True, hide_ended=True,
+        )
+
+    emoji, ar_label = ROYAL_CATEGORY_TITLES.get(cat_key, ("✨", cat_key))
 
     if not events:
-        await notifier.edit(chat_id, msg_id,
-                            "⚠️ لا توجد فعاليات متاحة الآن.",
-                            reply_markup=kb.back_to_menu())
+        txt = (
+            f"{emoji}  <b>{ar_label}</b>\n"
+            "════════════════════════\n"
+            "⚠️ لا توجد فعاليات متاحة حالياً في هذا التصنيف.\n"
+            "<i>تمّ تصفية كل فعالية منتهية أو مبيعة بالكامل تلقائياً.</i>\n\n"
+            "⛜️ جرّب تحديث القائمة أو تصفح تصنيفاً آخر."
+        )
+        await notifier.edit(
+            chat_id, msg_id, txt,
+            reply_markup=kb.events_keyboard([], page=0,
+                                              category_key=cat_key),
+        )
         return
 
-    await notifier.edit(
-        chat_id, msg_id,
-        f"🎫 <b>الفعاليات المتاحة</b> ({len(events)})\n\n"
-        f"اضغط فعالية لعرض تذاكرها:",
-        reply_markup=kb.events_keyboard(events, page=page),
+    page_size = 8
+    total = len(events)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages - 1)
+
+    header = (
+        f"{emoji}  <b>{ar_label}</b>\n"
+        "════════════════════════\n"
+        f"⛜️ عدد الفعاليات المتاحة: <b>{total}</b>\n"
+        f"📄 الصفحة <b>{page + 1}</b> من <b>{total_pages}</b>\n"
+        "════════════════════════\n"
+        "🟢 متاح وفير   🟡 محدود   ⚫ بدون خريطة\n"
+        "════════════════════════\n"
+        "✨ <i>اضغط على فعالية لعرض تذاكرها الملكيّة:</i>"
     )
+    await notifier.edit(
+        chat_id, msg_id, header,
+        reply_markup=kb.events_keyboard(
+            events, page=page, page_size=page_size,
+            category_key=cat_key,
+        ),
+    )
+
+
+# Legacy entry-point (kept so any old buttons still work).
+async def _show_events(chat_id: str, msg_id: int, arg: str,
+                       notifier: Notifier) -> None:
+    if arg == "refresh":
+        await _show_events_in_category(chat_id, msg_id, "all", "refresh",
+                                         notifier)
+    else:
+        await _show_events_in_category(chat_id, msg_id, "all", arg, notifier)
 
 
 async def _show_event(chat_id: str, slug: str, notifier: Notifier,
@@ -652,31 +802,56 @@ async def _show_event(chat_id: str, slug: str, notifier: Notifier,
     sub = (detail or {}).get("sub_title") or ""
     desc_raw = (detail or {}).get("description") or ""
     desc = re.sub(r"<[^>]+>", " ", desc_raw)
-    desc = re.sub(r"\s+", " ", desc).strip()[:300]
+    desc = re.sub(r"\s+", " ", desc).strip()[:280]
+
+    venue = (detail or {}).get("venue_name") or (detail or {}).get("venue") or ""
+    start_ts = (detail or {}).get("start_date_time") or 0
+    date_line = ""
+    if start_ts:
+        try:
+            import datetime as _dt
+            d = _dt.datetime.fromtimestamp(float(start_ts))
+            date_line = d.strftime("%Y-%m-%d • %H:%M")
+        except Exception:
+            date_line = ""
 
     tickets = (data or {}).get("tickets") or []
     active = [t for t in tickets if t.get("status") == "active"]
 
-    txt = f"🎭 <b>{title}</b>\n"
+    txt = (
+        f"👑  <b>{title}</b>\n"
+        "════════════════════════\n"
+    )
     if sub:
-        txt += f"{sub}\n"
+        txt += f"⛜️ <i>{sub}</i>\n"
+    if date_line:
+        txt += f"📅 <b>التاريخ:</b> <code>{date_line}</code>\n"
+    if venue:
+        txt += f"📍 <b>الموقع:</b> {venue}\n"
     if desc:
-        txt += f"\n{desc}\n"
+        txt += f"\n📜 {desc}\n"
 
     if active:
-        txt += f"\n🎟️ أنواع التذاكر المتاحة: <b>{len(active)}</b>\n\n"
-        txt += "اختر نوع التذكرة:"
+        txt += (
+            "\n════════════════════════\n"
+            f"🎟️ <b>أنواع التذاكر الملكيّة:</b>  {len(active)}\n"
+            "════════════════════════\n"
+            "✨ <i>اختر فئة تذكرتك:</i>"
+        )
         rkb = kb.ticket_types_keyboard(slug, tickets)
     else:
-        txt += "\n⚠️ <i>لا توجد تذاكر متاحة حالياً عبر API.</i>\n"
-        txt += ("قد تكون الفعالية تتطلب اشتراكاً، أو لم يُفتح بيعها بعد، "
-                "أو تُباع بطريقة مختلفة (مثل seats.io). "
-                "افتحها في المتصفح للتأكد:")
+        txt += (
+            "\n════════════════════════\n"
+            "⚠️ <i>لا توجد تذاكر متاحة الآن.</i>\n"
+            "قد تكون الفعالية تتطلب اشتراكاً أو لم يُفتح بيعها بعد."
+        )
         rkb = {"inline_keyboard": [
             [{"text": "🌐 فتح الفعالية في المتصفح",
               "url": f"https://webook.com/ar/events/{slug}"}],
-            [{"text": "⬅️ رجوع للفعاليات", "callback_data": "events:0"}],
-            [{"text": "🏠 القائمة", "callback_data": "menu"}],
+            [{"text": "🔙 العودة للتصنيفات",
+              "callback_data": "cats:menu"}],
+            [{"text": "🏠 القائمة الرئيسية",
+              "callback_data": "menu"}],
         ]}
 
     if edit_msg_id:
