@@ -10,3 +10,9 @@ python-multipart==0.0.12
 # V14: HTTP/2-native stealth client (replaces aiohttp on the hot booking path)
 httpx[http2]==0.27.2
 h2==4.1.0
+# V14.1 + V15: TLS/JA3-impersonating HTTP client (Cloudflare bypass)
+curl_cffi>=0.7.4
+# V15: WebSocket sniper for seats.io real-time drop alerts
+websockets>=12.0
+# V15: Render API deploy hook
+requests>=2.31.0

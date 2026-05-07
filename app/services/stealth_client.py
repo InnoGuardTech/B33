@@ -1,29 +1,25 @@
 """
-V14 — StealthClient: HTTP/2-native, fingerprint-rotated, proxy-per-account.
+V14.1 — StealthClient on top of curl_cffi (TLS/JA3 + HTTP/2 impersonation).
 
-Inspired by bot00's pingy-http (Go) wrapper but reimplemented on top of
-httpx[http2] for Python. Key properties:
+Why curl_cffi (and not httpx[http2])?
+-------------------------------------
+Cloudflare's WAF on api.webook.com fingerprints the TLS handshake (JA3),
+HTTP/2 frame settings and header order. httpx[http2] uses Python's stdlib
+TLS stack — its JA3 is unique to Python and Cloudflare blocks it with a
+403 / "{message: ''}". curl_cffi links against a libcurl built on
+BoringSSL/NSS and ships with REAL Chrome/Edge/Safari fingerprints — the
+TLS+H2 handshake is byte-for-byte identical to a real browser, so
+Cloudflare lets the request through.
 
-  • HTTP/2 always-on (h2 ALPN negotiation handled by httpx).
-  • User-Agent / sec-ch-ua / Accept-Language / Sec-Fetch headers rotated
-    from a pool of 10 real, recent desktop browsers.
-  • Optional `proxy_url` parameter — passes through to httpx.AsyncClient
-    so each booking account can run behind its OWN exit IP.
-  • Connection pooling per-instance: limits=20 / 8 per host (safe for
-    Render free tier).
-  • Privacy-preserving error logs (no body, no headers value leakage).
-  • Drop-in replacement for the `aiohttp.ClientSession` calls used in
-    booking_http.py — same `request(method, url, …)` shape.
+Verified live (Hydra V14 release):
+    GET https://api.webook.com/api/v2/currencies   →  200 OK
+    GET https://webook.com/ar/.../events/<slug>   →  200 OK   (CF passed)
 
-Public API:
+Public API (drop-in compatible with the V13 httpx version):
     async with StealthClient(proxy_url=acc.proxy_url) as cli:
         status, body = await cli.get_json(url, headers=...)
         status, body = await cli.post_json(url, headers=..., json=...)
-        text = await cli.get_text(url, headers=...)
-
-The class can also be used as a long-lived singleton (without `async with`)
-for the shared meta-fetch path; just remember to call `await client.close()`
-during shutdown.
+        status, text = await cli.get_text(url, headers=...)
 """
 from __future__ import annotations
 
@@ -33,43 +29,33 @@ import random
 import secrets as _secrets
 from typing import Any, Optional
 
-import httpx
+try:
+    from curl_cffi.requests import AsyncSession  # type: ignore
+    from curl_cffi.requests.errors import RequestsError  # type: ignore
+    _CURL_CFFI_OK = True
+    _IMPORT_ERR = None
+except Exception as _e:  # pragma: no cover
+    AsyncSession = None  # type: ignore
+    RequestsError = Exception  # type: ignore
+    _CURL_CFFI_OK = False
+    _IMPORT_ERR = _e
 
 log = logging.getLogger("stealth_client")
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Fingerprint pools — 10 real, recent (Q1 2025) desktop browsers
+# Browser-impersonation pool — keep newest at the top.
 # ════════════════════════════════════════════════════════════════════════
-USER_AGENTS: tuple[str, ...] = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) "
-    "Gecko/20100101 Firefox/131.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:131.0) "
-    "Gecko/20100101 Firefox/131.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-)
-
-# sec-ch-ua client-hints aligned with each Chromium/Edge UA above.
-SEC_CH_UA_VARIANTS: tuple[str, ...] = (
-    '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="24"',
-    '"Google Chrome";v="129", "Chromium";v="129", "Not_A Brand";v="24"',
-    '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+IMPERSONATE_POOL: tuple[str, ...] = (
+    "chrome131",
+    "chrome124",
+    "chrome120",
+    "chrome119",
+    "chrome116",
+    "edge101",
+    "edge99",
+    "safari17_0",
+    "safari15_5",
 )
 
 ACCEPT_LANGUAGES: tuple[str, ...] = (
@@ -80,67 +66,29 @@ ACCEPT_LANGUAGES: tuple[str, ...] = (
 )
 
 
-def _platform_for_ua(ua: str) -> str:
-    if "Macintosh" in ua:
-        return '"macOS"'
-    if "Linux" in ua:
-        return '"Linux"'
-    return '"Windows"'
-
-
-def _is_chromium_like(ua: str) -> bool:
-    return ("Chrome/" in ua) or ("Edg/" in ua)
-
-
-def random_fingerprint(seed: Optional[str] = None) -> dict[str, str]:
-    """Return a coherent set of headers that mimic ONE real browser.
-
-    If `seed` is provided (e.g. an account_id), the fingerprint is
-    deterministic per-account so a given Webook account always presents
-    the same browser identity (avoids "your fingerprint changed" alerts).
-    """
-    rng = random.Random(seed) if seed else random.Random()
-    ua = rng.choice(USER_AGENTS)
-    headers = {
-        "user-agent": ua,
-        "accept": "application/json, text/plain, */*",
-        "accept-language": rng.choice(ACCEPT_LANGUAGES),
-        "accept-encoding": "gzip, deflate, br",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    }
-    if _is_chromium_like(ua):
-        headers["sec-ch-ua"] = rng.choice(SEC_CH_UA_VARIANTS)
-        headers["sec-ch-ua-mobile"] = "?0"
-        headers["sec-ch-ua-platform"] = _platform_for_ua(ua)
-    return headers
-
-
 def random_request_id() -> str:
-    """X-Request-Id helper — useful when troubleshooting Cloudflare logs."""
     return _secrets.token_hex(8)
 
 
 def _redact_url(url: str) -> str:
-    """Strip query string from a URL before logging (avoids leaking
-    bearer/token query params)."""
     q = url.find("?")
     return url if q < 0 else url[:q] + "?…"
+
+
+def pick_profile(seed: Optional[str] = None) -> str:
+    rng = random.Random(seed) if seed else random.Random()
+    return rng.choice(IMPERSONATE_POOL)
+
+
+def pick_accept_language(seed: Optional[str] = None) -> str:
+    rng = random.Random(seed + ":lang" if seed else None) if seed else random.Random()
+    return rng.choice(ACCEPT_LANGUAGES)
 
 
 # ════════════════════════════════════════════════════════════════════════
 # StealthClient
 # ════════════════════════════════════════════════════════════════════════
 class StealthClient:
-    """Thin, high-performance wrapper over httpx.AsyncClient.
-
-    Each instance binds:
-      • One `httpx.AsyncClient` with HTTP/2 negotiated via ALPN.
-      • One coherent fingerprint (UA + sec-ch-ua + locale).
-      • Optional proxy_url (per-account isolation).
-    """
-
     DEFAULT_TIMEOUT = 25.0
 
     def __init__(
@@ -148,73 +96,64 @@ class StealthClient:
         *,
         proxy_url: Optional[str] = None,
         fingerprint_seed: Optional[str] = None,
+        impersonate: Optional[str] = None,
         timeout: float = DEFAULT_TIMEOUT,
-        max_connections: int = 20,
-        max_keepalive: int = 8,
         verify: bool = True,
     ):
+        if not _CURL_CFFI_OK:
+            raise RuntimeError(
+                "curl_cffi is not installed. Run "
+                "`pip install curl_cffi>=0.7.4` (added to requirements.txt "
+                f"in V14). Original import error: {_IMPORT_ERR}"
+            )
         self.proxy_url = (proxy_url or "").strip() or None
         self.fingerprint_seed = fingerprint_seed
-        self._headers = random_fingerprint(fingerprint_seed)
+        self._impersonate = impersonate or pick_profile(fingerprint_seed)
+        self._accept_language = pick_accept_language(fingerprint_seed)
         self._timeout = timeout
-        self._client: Optional[httpx.AsyncClient] = None
+        self._verify = verify
+        self._session: Optional[Any] = None
         self._lock = asyncio.Lock()
 
-        # httpx.Limits: a sane default that respects Render's 512MB envelope.
-        self._limits = httpx.Limits(
-            max_connections=max_connections,
-            max_keepalive_connections=max_keepalive,
-            keepalive_expiry=30.0,
-        )
-        self._verify = verify
-
-    # ── async context-manager support ─────────────────────────────────
     async def __aenter__(self) -> "StealthClient":
-        await self._ensure_client()
+        await self._ensure_session()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    async def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is not None and not self._client.is_closed:
-            return self._client
+    async def _ensure_session(self):
+        if self._session is not None:
+            return self._session
         async with self._lock:
-            if self._client is not None and not self._client.is_closed:
-                return self._client
-
+            if self._session is not None:
+                return self._session
             kwargs: dict[str, Any] = {
-                "http2": True,
-                "timeout": httpx.Timeout(
-                    self._timeout, connect=10.0, read=self._timeout,
-                ),
-                "limits": self._limits,
+                "impersonate": self._impersonate,
+                "timeout": self._timeout,
                 "verify": self._verify,
-                "follow_redirects": True,
-                "headers": dict(self._headers),
             }
             if self.proxy_url:
-                # httpx 0.27+ uses `proxy=` (singular) for AsyncClient.
-                kwargs["proxy"] = self.proxy_url
-
-            self._client = httpx.AsyncClient(**kwargs)
+                kwargs["proxies"] = {
+                    "http": self.proxy_url,
+                    "https": self.proxy_url,
+                }
+            self._session = AsyncSession(**kwargs)  # type: ignore
             log.debug(
-                "stealth client up: http2=on proxy=%s ua=%s…",
-                "yes" if self.proxy_url else "no",
-                self._headers.get("user-agent", "")[:48],
+                "stealth client up: impersonate=%s proxy=%s",
+                self._impersonate, "yes" if self.proxy_url else "no",
             )
-            return self._client
+            return self._session
 
     async def close(self) -> None:
-        c = self._client
-        self._client = None
-        if c is not None and not c.is_closed:
+        s = self._session
+        self._session = None
+        if s is not None:
             try:
-                await c.aclose()
+                await s.close()
             except Exception:
                 pass
 
-    # ── core request ──────────────────────────────────────────────────
     async def request(
         self,
         method: str,
@@ -226,36 +165,37 @@ class StealthClient:
         data: Any = None,
         cookies: Any = None,
         timeout: Optional[float] = None,
-    ) -> httpx.Response:
-        client = await self._ensure_client()
-        merged: dict[str, str] = dict(self._headers)
+        follow_redirects: bool = True,
+    ):
+        s = await self._ensure_session()
+        merged: dict[str, str] = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": self._accept_language,
+            "origin": "https://webook.com",
+            "referer": "https://webook.com/",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+        }
         if headers:
             for k, v in headers.items():
                 if v is None:
-                    merged.pop(k, None)
+                    merged.pop(k.lower(), None)
                 else:
                     merged[str(k).lower()] = str(v)
-        # Rotate request id every call so retries don't collide.
         merged.setdefault("x-request-id", random_request_id())
-
         try:
-            resp = await client.request(
+            return await s.request(
                 method.upper(), url,
                 headers=merged, params=params,
                 json=json, data=data, cookies=cookies,
                 timeout=timeout if timeout is not None else self._timeout,
+                allow_redirects=follow_redirects,
             )
-            return resp
-        except httpx.TimeoutException:
-            log.debug("stealth %s %s timed out", method.upper(),
-                      _redact_url(url))
-            raise
-        except httpx.RequestError as e:
+        except RequestsError as e:
             log.debug("stealth %s %s err: %s", method.upper(),
                       _redact_url(url), type(e).__name__)
             raise
 
-    # ── convenience helpers (drop-in for aiohttp call sites) ──────────
     async def get_json(self, url: str, **kw) -> tuple[int, Any]:
         r = await self.request("GET", url, **kw)
         return r.status_code, _safe_json(r)
@@ -271,20 +211,19 @@ class StealthClient:
         except Exception:
             return r.status_code, ""
 
-    # ── public introspection ──────────────────────────────────────────
     @property
     def fingerprint(self) -> dict[str, str]:
-        return dict(self._headers)
+        return {
+            "impersonate": self._impersonate,
+            "accept-language": self._accept_language,
+        }
 
     @property
     def http_version(self) -> str:
-        if self._client is None:
-            return "unknown"
-        # httpx exposes http_version on Response; here we return the cfg.
-        return "h2" if True else "1.1"
+        return "h2"
 
 
-def _safe_json(r: httpx.Response) -> Any:
+def _safe_json(r) -> Any:
     try:
         return r.json()
     except Exception:
@@ -295,25 +234,20 @@ def _safe_json(r: httpx.Response) -> Any:
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Module-level shared client (for read-only, no-proxy paths)
+# Module-level shared client
 # ════════════════════════════════════════════════════════════════════════
 _shared_client: Optional[StealthClient] = None
 _shared_lock = asyncio.Lock()
 
 
 async def get_shared_stealth_client() -> StealthClient:
-    """Process-wide StealthClient for unauthenticated, no-proxy reads
-    (asset bundle, public event meta when shared cache misses, etc.).
-    """
     global _shared_client
-    if _shared_client is not None and _shared_client._client is not None \
-            and not _shared_client._client.is_closed:
+    if _shared_client is not None and _shared_client._session is not None:
         return _shared_client
     async with _shared_lock:
-        if _shared_client is None or _shared_client._client is None \
-                or _shared_client._client.is_closed:
+        if _shared_client is None or _shared_client._session is None:
             _shared_client = StealthClient(fingerprint_seed="shared-anon")
-            await _shared_client._ensure_client()
+            await _shared_client._ensure_session()
         return _shared_client
 
 
@@ -327,8 +261,16 @@ async def close_shared_stealth_client() -> None:
         _shared_client = None
 
 
+def random_fingerprint(seed: Optional[str] = None) -> dict[str, str]:
+    """Compatibility shim — real impersonation happens at TLS layer."""
+    return {
+        "impersonate": pick_profile(seed),
+        "accept-language": pick_accept_language(seed),
+    }
+
+
 # ════════════════════════════════════════════════════════════════════════
-# Self-test block
+# Self-test
 # ════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":  # pragma: no cover
     import sys
@@ -340,39 +282,38 @@ if __name__ == "__main__":  # pragma: no cover
     )
 
     async def _selftest() -> int:
-        print("🧪 Hydra V14 — stealth_client self-test")
+        print("🧪 Hydra V14.1 — stealth_client (curl_cffi) self-test")
         print("=" * 70)
 
-        # Fingerprint stability per seed
-        a = random_fingerprint("acc_001")
-        b = random_fingerprint("acc_001")
-        assert a["user-agent"] == b["user-agent"], "seeded fingerprint must be stable"
-        print(f"  ✓ Seeded fingerprint stable: {a['user-agent'][:60]}…")
+        a = pick_profile("acc_001")
+        b = pick_profile("acc_001")
+        assert a == b, "seeded profile must be stable"
+        print(f"  ✓ Seeded profile stable: {a}")
 
-        c = random_fingerprint("acc_002")
-        print(f"  ✓ Different seed → {c['user-agent'][:60]}…")
-
-        # HTTP/2 round-trip against a public h2 endpoint
         async with StealthClient() as cli:
             t0 = time.time()
-            r = await cli.request("GET", "https://www.cloudflare.com/cdn-cgi/trace")
+            r = await cli.request(
+                "GET",
+                "https://api.webook.com/api/v2/currencies",
+                headers={"sec-fetch-site": "same-site"},
+            )
             elapsed = (time.time() - t0) * 1000
-            print(f"\n  ✓ HTTP {r.status_code} in {elapsed:.0f} ms"
-                  f" (h2={r.http_version})")
-            print(f"    body preview: {r.text[:80]!r}")
+            print(f"  ✓ /currencies → HTTP {r.status_code} in {elapsed:.0f} ms")
+            assert r.status_code == 200
+            assert "Saudi Riyal" in r.text or "SAR" in r.text
 
-        # Webook reachability (the actual hot path)
         async with StealthClient(fingerprint_seed="hydra-v14-test") as cli:
             t0 = time.time()
             r = await cli.request(
                 "GET",
-                "https://api.webook.com/api/v2/event-detail/"
-                "al-hilal-vs-al-nassr-test?lang=en&visible_in=rs",
+                "https://webook.com/ar/sa/bur/sports-event/events/"
+                "spl-week-32-al-najmah-vs-al-hazem-7715",
             )
             elapsed = (time.time() - t0) * 1000
-            print(f"  ✓ Webook API HTTP {r.status_code} in {elapsed:.0f} ms"
-                  f" (h2={r.http_version})")
+            print(f"  ✓ event HTML  → HTTP {r.status_code} in {elapsed:.0f} ms")
+            assert r.status_code == 200
 
+        print("\n🏆 All self-tests passed. curl_cffi successfully bypasses CF.")
         return 0
 
     sys.exit(asyncio.run(_selftest()))

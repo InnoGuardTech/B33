@@ -122,6 +122,14 @@ MAP_ALLOWED_DOMAINS = (
 # `image` and `font` were the V13 footguns (broke seats.io rendering).
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
+# V14.1: In **VISUAL MAP MODE** (block-selection UI) we relax the blocker
+# even further — only ads/analytics are dropped. Everything else (images,
+# fonts, scripts, stylesheets) loads so the seats.io chart can show its
+# row icons, hover labels, category swatches, etc.
+# Background-polling code paths keep using the lightweight router to stay
+# inside the 512 MB Render envelope.
+VISUAL_MAP_BLOCKED_RESOURCE_TYPES: set[str] = set()  # nothing blocked
+
 # Always-block resource types regardless of domain (analytics / ads).
 HARD_BLOCKED_PATTERNS = (
     "google-analytics.com",
@@ -262,6 +270,35 @@ async def install_lightweight_router(ctx) -> None:
         log.warning("install_lightweight_router failed: %s", e)
 
 
+async def install_visual_map_router(ctx) -> None:
+    """V14.1 — VISUAL MAP MODE router.
+
+    Used when the user is actively picking blocks on the seats.io chart.
+    Only ads/analytics are blocked; everything else (images, fonts,
+    scripts, CSS, XHR) flows through so the chart can render exactly as
+    a real browser would. Costs more RAM than the lightweight router but
+    is only active for the brief window during block selection.
+    """
+    async def _router(route, request):
+        try:
+            url = request.url or ""
+            if _is_hard_blocked(url):
+                await route.abort()
+                return
+            await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    try:
+        await ctx.route("**/*", _router)
+        log.info("🎨 visual-map router installed (full asset rendering enabled)")
+    except Exception as e:
+        log.warning("install_visual_map_router failed: %s", e)
+
+
 # ════════════════════════════════════════════════════════════════════════
 # Singleton state
 # ════════════════════════════════════════════════════════════════════════
@@ -340,16 +377,22 @@ class _BrowserSingleton:
     async def context(self, *, label: str = "",
                       extra_args: Optional[dict[str, Any]] = None,
                       proxy_url: Optional[str] = None,
-                      install_router: bool = True):
+                      install_router: bool = True,
+                      visual_map_mode: bool = False):
         """Yield a fresh BrowserContext with randomized fingerprint.
 
         Closes the context on exit while the browser stays warm.
 
-        New in V14:
-          • proxy_url: per-context proxy (overrides global). Critical for
+        Args:
+          proxy_url: per-context proxy (overrides global). Critical for
             account isolation. Format: http://user:pass@host:port
-          • install_router: True → install the V14 lightweight router so
-            heavy assets are blocked except for map domains.
+          install_router: True → install a request router. Choice between
+            lightweight (RAM-saving) and visual-map (full rendering) is
+            governed by ``visual_map_mode``.
+          visual_map_mode: V14.1 — when True, install the visual-map
+            router instead of the lightweight one. Use this for the
+            block-selection screen so the user can SEE the seats.io
+            chart with all icons / fonts / styles.
         """
         async with self._lock:
             await self._ensure_started()
@@ -372,7 +415,10 @@ class _BrowserSingleton:
 
         ctx = await self._browser.new_context(**kwargs)
         if install_router:
-            await install_lightweight_router(ctx)
+            if visual_map_mode:
+                await install_visual_map_router(ctx)
+            else:
+                await install_lightweight_router(ctx)
 
         self._active_contexts += 1
         self._last_used = time.time()
@@ -440,18 +486,40 @@ _singleton = _BrowserSingleton()
 async def browser_context(*, label: str = "",
                           extra_args: Optional[dict[str, Any]] = None,
                           proxy_url: Optional[str] = None,
-                          install_router: bool = True):
+                          install_router: bool = True,
+                          visual_map_mode: bool = False):
     """Public API: get an isolated BrowserContext from the warm singleton.
 
     Args:
-        label:          arbitrary identifier (account_id is conventional).
-        extra_args:     overrides for new_context() kwargs.
-        proxy_url:      per-context proxy (V14).
-        install_router: True → enable selective resource blocker (V14).
+        label:           arbitrary identifier (account_id is conventional).
+        extra_args:      overrides for new_context() kwargs.
+        proxy_url:       per-context proxy (V14).
+        install_router:  True → enable a request router (V14).
+        visual_map_mode: V14.1 — True for the block-selection / chart UI,
+                         False for background polling (RAM-optimised).
     """
     async with _singleton.context(
         label=label, extra_args=extra_args,
         proxy_url=proxy_url, install_router=install_router,
+        visual_map_mode=visual_map_mode,
+    ) as ctx:
+        yield ctx
+
+
+@asynccontextmanager
+async def visual_map_context(*, label: str = "",
+                             proxy_url: Optional[str] = None,
+                             extra_args: Optional[dict[str, Any]] = None):
+    """V14.1 — convenience wrapper for the seats.io block-selection UI.
+
+    Equivalent to ``browser_context(..., visual_map_mode=True)``.
+    Use this when the user explicitly needs to SEE the chart (block
+    picker / interactive seat selection). Background polling and the
+    booking hot-path should keep using ``browser_context()`` (RAM-saver).
+    """
+    async with browser_context(
+        label=label, proxy_url=proxy_url, extra_args=extra_args,
+        install_router=True, visual_map_mode=True,
     ) as ctx:
         yield ctx
 

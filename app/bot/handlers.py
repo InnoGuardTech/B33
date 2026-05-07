@@ -30,6 +30,7 @@ from app.core.storage import (
 )
 from app.services import auth_service
 from app.services.block_analyzer import extract_blocks
+from app.services.url_parser import extract_slug as _bulletproof_extract_slug
 from app.services.booking_orchestrator import book_all
 from app.services.distributor import describe_plan, distribute
 from app.services.event_discovery import enrich_all, fetch_event_slugs
@@ -85,24 +86,14 @@ def _authorized(chat_id: str) -> bool:
 
 
 def _extract_slug_from_link(text: str) -> str | None:
-    """Parse 'https://webook.com/ar/events/<slug>' or '<slug>' into slug."""
-    text = text.strip()
-    if not text:
-        return None
-    if text.startswith("http"):
-        try:
-            p = urlparse(text)
-            parts = [x for x in p.path.split("/") if x]
-            # patterns: /ar/events/<slug>  or /en/events/<slug>/book
-            for i, seg in enumerate(parts):
-                if seg == "events" and i + 1 < len(parts):
-                    return parts[i + 1]
-        except Exception:
-            return None
-    # treat raw text as slug only if it looks like one (lowercase/digits/hyphens)
-    if re.fullmatch(r"[a-z0-9][a-z0-9\-]{2,}", text):
-        return text
-    return None
+    """V14.1 — bulletproof slug extractor.
+
+    Delegates to ``app.services.url_parser.extract_slug`` which handles
+    ALL Webook URL shapes (with/without scheme, with/without lang/country
+    prefixes, with trailing /book or query strings, percent-encoded chars,
+    etc.) and rejects plain English text. See unit tests in that module.
+    """
+    return _bulletproof_extract_slug(text)
 
 
 # ════════════════════════════════════════════════════════════════════════
