@@ -112,7 +112,7 @@ def _find_ticket_blob(raw_payload: dict[str, Any], ticket_id: str) -> dict[str, 
     return {}
 
 
-async def fetch_event_meta(session: aiohttp.ClientSession, slug: str, bearer: str) -> dict[str, Any]:
+async def _fetch_event_meta_uncached(session: aiohttp.ClientSession, slug: str, bearer: str) -> dict[str, Any]:
     url = f"{WEBOOK_API}/event-detail/{slug}?lang=en&visible_in=rs"
     status, data = await _get(session, url, bearer)
     if status != 200 or not isinstance(data, dict):
@@ -128,6 +128,26 @@ async def fetch_event_meta(session: aiohttp.ClientSession, slug: str, bearer: st
         "require_visa": bool(d.get("require_visa")),
         "raw": d,
     }
+
+
+async def fetch_event_meta(session: aiohttp.ClientSession, slug: str, bearer: str) -> dict[str, Any]:
+    """V13: Cached wrapper around the raw event-meta fetch.
+
+    When N accounts target the same event in parallel, only one upstream
+    call hits Webook for 30 seconds. The cached payload is read-only meta
+    (event_id, is_seated, dates, ticket_categories) — NO per-account or
+    bearer-specific state. Cache key intentionally omits bearer.
+    """
+    from app.services.perf_cache import event_meta_cache
+
+    async def _do_fetch():
+        return await _fetch_event_meta_uncached(session, slug, bearer)
+
+    try:
+        return await event_meta_cache.get_or_fetch(f"meta:{slug}", _do_fetch)
+    except Exception:
+        # Fail-open: never let cache layer break a booking.
+        return await _do_fetch()
 
 
 async def fetch_raw_ticket_details(session: aiohttp.ClientSession, slug: str, bearer: str = "") -> dict[str, Any]:

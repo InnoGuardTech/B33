@@ -23,6 +23,42 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional
 
+
+# ════════════════════════════════════════════════════════════════════════
+# V13: Privacy-preserving error logging
+# ════════════════════════════════════════════════════════════════════════
+MAX_SQL_LOG_LEN = 120  # truncate SQL in error logs to avoid leaking long
+                       # multi-statement scripts or embedded values.
+MAX_PARAM_COUNT_LOG = 8  # only log parameter count + types, never values.
+
+
+def _redact_params(params: Iterable) -> str:
+    """Return a privacy-safe summary of params for error logs.
+
+    Never logs raw values — only count and a per-position type tag
+    so we can debug shape mismatches without leaking emails, passwords,
+    bearer tokens, or PII.
+    """
+    try:
+        items = list(params) if params else []
+    except Exception:
+        return "params=<unrepr>"
+    n = len(items)
+    if n == 0:
+        return "params=()"
+    sample = items[:MAX_PARAM_COUNT_LOG]
+    types = [type(v).__name__ if v is not None else "None" for v in sample]
+    suffix = "" if n <= MAX_PARAM_COUNT_LOG else f",+{n-MAX_PARAM_COUNT_LOG}"
+    return f"params=<n={n}, types=[{','.join(types)}{suffix}]>"
+
+
+def _truncate_sql(sql: str, limit: int = MAX_SQL_LOG_LEN) -> str:
+    """Truncate SQL for error logs and squash whitespace runs."""
+    if not sql:
+        return ""
+    s = re.sub(r"\s+", " ", sql).strip()
+    return s if len(s) <= limit else s[: limit - 1] + "…"
+
 log = logging.getLogger("db")
 
 PG_URL = (
@@ -185,7 +221,13 @@ class _PgConn:
         try:
             cur.execute(sql_pg, tuple(params) if params else ())
         except Exception as e:
-            log.error(f"[db] execute err on: {sql_pg[:140]} | {e}")
+            # V13: never log raw SQL or param VALUES — truncate + redact.
+            log.error(
+                "[db] execute err | sql=%s | %s | %s",
+                _truncate_sql(sql_pg),
+                _redact_params(params),
+                str(e)[:200],
+            )
             raise
         return _PgCursorWrapper(cur, self._conn, sql_pg)
 
@@ -209,13 +251,17 @@ class _PgConn:
                     cur.execute("ROLLBACK TO SAVEPOINT _stmt_sp")
                 except Exception:
                     pass
-                log.warning(f"[db] script stmt skipped: {stmt[:80]} | {e}")
+                log.warning(
+                    "[db] script stmt skipped | sql=%s | %s",
+                    _truncate_sql(stmt, 80),
+                    str(e)[:160],
+                )
 
     def commit(self):
         try:
             self._conn.commit()
         except Exception as e:
-            log.error(f"[db] commit err: {e}")
+            log.error("[db] commit err: %s", str(e)[:200])
 
     def rollback(self):
         try:

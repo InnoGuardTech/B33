@@ -99,15 +99,72 @@ def authorized_chat_ids() -> list[str]:
     return ids
 
 
+# V13 hardening: NO default values for sensitive secrets.
+# Missing env values cause hard-fail at startup (validate_required_secrets).
 def webook_public_token() -> str:
-    return _env_or(
-        "WEBOOK_PUBLIC_TOKEN",
-        "e9aac1f2f0b6c07d6be070ed14829de684264278359148d6a582ca65a50934d2",
-    )
+    return _env_or("WEBOOK_PUBLIC_TOKEN", "")
 
 
 def admin_password() -> str:
-    return _env_or("ADMIN_PASSWORD", "webook-admin")
+    return _env_or("ADMIN_PASSWORD", "")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# V13: Mandatory secret validation — must be called at startup.
+# Refuses to boot when critical secrets are missing or use known defaults.
+# ════════════════════════════════════════════════════════════════════════
+_FORBIDDEN_DEFAULTS = {
+    # Legacy hardcoded values that MUST never appear in production.
+    "WEBOOK_PUBLIC_TOKEN": {
+        "e9aac1f2f0b6c07d6be070ed14829de684264278359148d6a582ca65a50934d2",
+    },
+    "ADMIN_PASSWORD": {"webook-admin", "admin", "password", "changeme", ""},
+}
+
+
+def validate_required_secrets() -> None:
+    """Hard-fail boot when critical secrets are missing or weak.
+
+    Called from main.py BEFORE any service starts. Returns None on success;
+    calls sys.exit(78) on failure (78 = config error in sysexits.h).
+    """
+    import sys
+
+    errors: list[str] = []
+    required: dict[str, str] = {
+        "ADMIN_PASSWORD": admin_password(),
+        "WEBOOK_PUBLIC_TOKEN": webook_public_token(),
+    }
+
+    for key, val in required.items():
+        v = (val or "").strip()
+        if not v:
+            errors.append(f"{key} is missing — set it in Render env vars.")
+            continue
+        bad = _FORBIDDEN_DEFAULTS.get(key, set())
+        if v in bad:
+            errors.append(
+                f"{key} uses a forbidden legacy/default value — "
+                f"rotate the secret in Render env vars."
+            )
+            continue
+        if key == "ADMIN_PASSWORD" and len(v) < 8:
+            errors.append(
+                f"{key} is too short ({len(v)} chars). "
+                f"Minimum is 8 characters for production."
+            )
+
+    if errors:
+        sys.stderr.write(
+            "\n\n🛑  V13 STARTUP REFUSED — security validation failed:\n"
+        )
+        for e in errors:
+            sys.stderr.write(f"  • {e}\n")
+        sys.stderr.write(
+            "\nFix these in the Render dashboard → Environment, "
+            "then redeploy.\n\n"
+        )
+        sys.exit(78)  # EX_CONFIG
 
 
 # ── Seats.io / SeatCloud runtime tuning ────────────────────────────────
@@ -183,6 +240,11 @@ def two_captcha_api_key() -> str:
 TELEGRAM_BOT_TOKEN = telegram_bot_token()
 TELEGRAM_CHAT_ID = telegram_chat_id()
 AUTHORIZED_CHAT_IDS = authorized_chat_ids()
+# WEBOOK_PUBLIC_TOKEN is intentionally re-evaluated at every call site so a
+# late env injection (e.g. from /admin) takes effect without a process
+# restart. The module-level alias is kept for backwards-compatibility but
+# returns an empty string when the env var is missing — callers should
+# prefer webook_public_token().
 WEBOOK_PUBLIC_TOKEN = webook_public_token()
 SEATSIO_ENABLED = seatsio_enabled()
 SEATSIO_PREWARM_ENABLED = seatsio_prewarm_enabled()

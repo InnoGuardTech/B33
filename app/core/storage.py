@@ -48,6 +48,12 @@ _V12_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_events_end_date   ON events(end_date)",
     "CREATE INDEX IF NOT EXISTS idx_events_first_seen ON events(first_seen_at)",
     "CREATE INDEX IF NOT EXISTS idx_events_start_date ON events(start_date)",
+    # V13: Partial index — dramatically speeds up the dominant
+    # "only_available + newest-first" listing query (uses index-only scan
+    # on the hot subset). Skipped automatically on SQLite (still legal SQL).
+    "CREATE INDEX IF NOT EXISTS idx_events_active "
+    "ON events(first_seen_at DESC, start_date) "
+    "WHERE has_availability = 1",
 )
 
 _MIGRATED = False

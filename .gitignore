@@ -23,3 +23,10 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# V13 hardening — never commit test artifacts with embedded secrets
+test_*.py
+*.test.py
+.env
+.env.*
+!.env.example

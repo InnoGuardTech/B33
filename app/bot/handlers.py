@@ -1405,7 +1405,15 @@ async def long_poll_loop(notifier: Notifier) -> None:
             if data and data.get("ok"):
                 for upd in data.get("result", []):
                     offset = upd["update_id"] + 1
-                    asyncio.create_task(dispatch(upd, notifier))
+                    # V13: protect against GC cancellation
+                    try:
+                        from main import spawn_protected
+                        spawn_protected(
+                            dispatch(upd, notifier),
+                            name=f"tg-poll-{upd['update_id']}",
+                        )
+                    except Exception:
+                        asyncio.create_task(dispatch(upd, notifier))
         except Exception as e:
             log.warning(f"long-poll err: {e}")
             await asyncio.sleep(3)

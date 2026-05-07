@@ -10,21 +10,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.core.logging_setup import setup_logging
+setup_logging()
+
 from app.bot.handlers import dispatch, long_poll_loop
 from app.bot.notifier import Notifier
 from app.core.config import (
     HOST, KEEP_ALIVE_ENABLED, LOG_LEVEL, PORT, PUBLIC_URL,
-    telegram_bot_token,
+    telegram_bot_token, validate_required_secrets,
 )
 from app.web.admin import router as admin_router, maybe_rebind_webhook
 from app.web.picker import router as picker_router
-from app.core.logging_setup import setup_logging
 from app.core.db import backend as db_backend, is_persistent as db_is_persistent
 from app.core.storage import (
     list_accounts, list_bookings, list_recent_events,
@@ -32,12 +35,41 @@ from app.core.storage import (
 from app.services.event_monitor import fetch_loop
 from app.services.keep_alive import keep_alive_loop
 from app.services.seatsio_runtime import stop_all as stop_seat_warmers
+from app.services.perf_cache import (
+    close_shared_session, turnstile_pool,
+)
+from app.services.browser_pool import shutdown_browser_singleton
 
-setup_logging()
+# V13: Mandatory secret validation — hard-fail if ADMIN_PASSWORD or
+# WEBOOK_PUBLIC_TOKEN are missing or use a forbidden default value.
+validate_required_secrets()
+
 log = logging.getLogger("main")
 
 
 background_tasks: list[asyncio.Task] = []
+
+# V13: WeakSet of fire-and-forget tasks so the GC does not cancel them
+# mid-flight (CPython collects orphan tasks aggressively in 3.10+).
+_fire_and_forget_tasks: "weakref.WeakSet[asyncio.Task]" = weakref.WeakSet()
+
+
+def spawn_protected(coro, *, name: str | None = None) -> asyncio.Task:
+    """Create a task that survives until completion (no GC cancellation).
+
+    Replacement for bare ``asyncio.create_task`` for fire-and-forget paths
+    (Telegram webhook dispatch, etc.). The task is held by a WeakSet AND
+    wrapped in ``asyncio.shield`` so accidental ``cancel()`` on the parent
+    coroutine cannot abort it.
+    """
+    async def _shielded():
+        try:
+            await asyncio.shield(coro)
+        except asyncio.CancelledError:
+            return
+    t = asyncio.create_task(_shielded(), name=name or "fire-and-forget")
+    _fire_and_forget_tasks.add(t)
+    return t
 
 
 @asynccontextmanager
@@ -50,6 +82,38 @@ async def lifespan(app: FastAPI):
     async def _deferred_startup():
         await asyncio.sleep(2)
         notifier = Notifier()
+
+        # V13: Start Turnstile prewarm pool early so 5 tokens are ready
+        # by the time the first booking fires.
+        try:
+            turnstile_pool.enable()
+            t = turnstile_pool.start()
+            if t is not None:
+                background_tasks.append(t)
+        except Exception as e:
+            log.warning(f"turnstile prewarm pool unavailable: {e}")
+
+        # V13: Re-classify any legacy NULL royal_category rows in the
+        # background (one-shot job, idempotent).
+        try:
+            from app.services.reclassify import reclassify_null_categories
+            background_tasks.append(asyncio.create_task(
+                reclassify_null_categories(),
+                name="reclassify-nulls",
+            ))
+        except Exception as e:
+            log.warning(f"reclassify task unavailable: {e}")
+
+        # V13: Pre-sale early-warning probe (10s polling on new slugs).
+        try:
+            from app.services.pre_sale_probe import pre_sale_probe_loop
+            background_tasks.append(asyncio.create_task(
+                pre_sale_probe_loop(notifier),
+                name="pre-sale-probe",
+            ))
+        except Exception as e:
+            log.warning(f"pre-sale probe unavailable: {e}")
+
         # Telegram webhook (best-effort)
         try:
             bot_tok = telegram_bot_token()
@@ -111,6 +175,19 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(*background_tasks, return_exceptions=True)
     try:
         await stop_seat_warmers()
+    except Exception:
+        pass
+    # V13: graceful resource teardown
+    try:
+        await turnstile_pool.stop()
+    except Exception:
+        pass
+    try:
+        await close_shared_session()
+    except Exception:
+        pass
+    try:
+        await shutdown_browser_singleton()
     except Exception:
         pass
 
@@ -246,7 +323,9 @@ async def telegram_webhook(request: Request):
         return JSONResponse({"ok": False, "error": "bad json"},
                             status_code=400)
     notifier = Notifier()
-    asyncio.create_task(dispatch(update, notifier))
+    # V13: protected against GC cancellation — critical for inline keyboard
+    # callbacks that must complete after the webhook returns 200.
+    spawn_protected(dispatch(update, notifier), name="tg-dispatch")
     return {"ok": True}
 
 

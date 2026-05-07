@@ -144,34 +144,12 @@ async def book_via_browser(*, email: str, password: str,
 
     deadline = time.time() + max_runtime
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            proxy=(
-                {
-                    "server": proxy_server().strip(),
-                    **({"username": proxy_username().strip()} if proxy_username().strip() else {}),
-                    **({"password": proxy_password().strip()} if proxy_password().strip() else {}),
-                }
-                if proxy_server().strip() else None
-            ),
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-            locale="ar-SA",
-            viewport={"width": 1366, "height": 900},
-        )
+    # V13: Use the Chromium singleton instead of launching a fresh browser.
+    # Saves ~150MB RAM and ~3s of startup per booking. The singleton applies
+    # low-RAM flags + UA/viewport/locale rotation automatically.
+    from app.services.browser_pool import browser_context
 
+    async with browser_context(label=email or "book") as ctx:
         if access_token:
             await _install_saved_auth(ctx, access_token, user_id, email)
             await ctx.set_extra_http_headers({
@@ -181,6 +159,17 @@ async def book_via_browser(*, email: str, password: str,
                 "origin": WEBOOK_ORIGIN,
                 "referer": f"{WEBOOK_ORIGIN}/",
             })
+
+        # V13: Inject stealth-extra HTTP headers consistent with the
+        # randomized UA assigned by the browser_pool.
+        try:
+            await ctx.set_extra_http_headers({
+                "accept-language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
+                "origin": WEBOOK_ORIGIN,
+                "referer": f"{WEBOOK_ORIGIN}/",
+            })
+        except Exception:
+            pass
 
         page = await ctx.new_page()
         seen_paytabs: list[str] = []
@@ -275,11 +264,8 @@ async def book_via_browser(*, email: str, password: str,
             result["error"] = f"timeout: {e}"
         except Exception as e:
             result["error"] = str(e)[:350]
-        finally:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+        # V13: Browser singleton stays warm; only the context closes
+        # automatically when the `async with browser_context(...)` block exits.
 
     return result
 
@@ -811,34 +797,10 @@ async def checkout_via_browser_fallback(
         clean.pop("seat_hold_token", None)
         body.update(clean)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            proxy=(
-                {
-                    "server": proxy_server().strip(),
-                    **({"username": proxy_username().strip()} if proxy_username().strip() else {}),
-                    **({"password": proxy_password().strip()} if proxy_password().strip() else {}),
-                }
-                if proxy_server().strip() else None
-            ),
-        )
-        ctx = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-            locale="ar-SA",
-            viewport={"width": 1366, "height": 900},
-        )
+    # V13: Use the singleton + randomized fingerprint context.
+    from app.services.browser_pool import browser_context
 
+    async with browser_context(label=email or "checkout") as ctx:
         try:
             # 1) Inject saved auth into localStorage
             if bearer:
@@ -962,10 +924,6 @@ async def checkout_via_browser_fallback(
                 out["error"] = f"browser_checkout_failed:{status}:{str(msg)[:200]}"
         except Exception as e:
             out["error"] = f"browser_fallback_exception:{str(e)[:200]}"
-        finally:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+        # V13: context auto-closes; browser stays warm for 30 minutes.
 
     return out
