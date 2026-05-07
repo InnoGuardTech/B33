@@ -101,8 +101,24 @@ def authorized_chat_ids() -> list[str]:
 
 # V13 hardening: NO default values for sensitive secrets.
 # Missing env values cause hard-fail at startup (validate_required_secrets).
+#
+# V15-final: WEBOOK_PUBLIC_TOKEN_BUILTIN_FALLBACK env flag (default ON)
+# allows the read paths to fall back to the public token mined from
+# webook.com's JS bundle when the env var is unset. The login path uses
+# this via app.services.login_robust.resolve_public_token().
 def webook_public_token() -> str:
     return _env_or("WEBOOK_PUBLIC_TOKEN", "")
+
+
+def webook_public_token_builtin_fallback() -> bool:
+    """Whether the bundled public token may be used when env is empty.
+
+    Defaults to True so the bot keeps working out-of-the-box on Render
+    if the operator hasn't yet rotated WEBOOK_PUBLIC_TOKEN. Set to false
+    to force a hard-fail when the env var is missing.
+    """
+    raw = _env_or("WEBOOK_PUBLIC_TOKEN_BUILTIN_FALLBACK", "true")
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def admin_password() -> str:
@@ -113,11 +129,11 @@ def admin_password() -> str:
 # V13: Mandatory secret validation — must be called at startup.
 # Refuses to boot when critical secrets are missing or use known defaults.
 # ════════════════════════════════════════════════════════════════════════
+# V15-final: the 64-char hex token below was previously banned as a
+# "legacy default". It's actually the legitimate public token Webook
+# bundles into its frontend (VITE_PUBLIC_TICKETS_API_TOKEN) — we now
+# whitelist it and route its use through the BUILTIN_FALLBACK flag.
 _FORBIDDEN_DEFAULTS = {
-    # Legacy hardcoded values that MUST never appear in production.
-    "WEBOOK_PUBLIC_TOKEN": {
-        "e9aac1f2f0b6c07d6be070ed14829de684264278359148d6a582ca65a50934d2",
-    },
     "ADMIN_PASSWORD": {"webook-admin", "admin", "password", "changeme", ""},
 }
 
@@ -133,8 +149,11 @@ def validate_required_secrets() -> None:
     errors: list[str] = []
     required: dict[str, str] = {
         "ADMIN_PASSWORD": admin_password(),
-        "WEBOOK_PUBLIC_TOKEN": webook_public_token(),
+        # WEBOOK_PUBLIC_TOKEN is now optional when BUILTIN_FALLBACK is on
+        # (the bundled token from Webook's JS is used automatically).
     }
+    if not webook_public_token_builtin_fallback():
+        required["WEBOOK_PUBLIC_TOKEN"] = webook_public_token()
 
     for key, val in required.items():
         v = (val or "").strip()

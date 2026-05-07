@@ -1,10 +1,12 @@
 """
-Authentication service.
+Authentication service — V15.1 robust HTTP-only path.
 
-Strategies:
-  1) Automated browser login with stealth-first import strategy.
-  2) Optional 2captcha fallback for reCAPTCHA v3 if browser execution fails.
-  3) Manual JWT paste fallback.
+Strategies (in order):
+  1) Robust HTTP login (login_robust.py) — curl_cffi + 2Captcha, no browser.
+     This is the FAST PATH and the only one used in production V15.1+.
+  2) Legacy Playwright login — retained as a deep fallback for diagnostics
+     when the robust path can't be used (no captcha key, etc.).
+  3) Manual JWT paste fallback — unchanged.
 
 After login, everything else stays HTTP-only.
 """
@@ -32,6 +34,7 @@ from app.core.config import (
     use_stealth_browser,
 )
 from app.core.storage import get_account, save_tokens, set_account_status
+from app.services.login_robust import robust_login as _robust_login
 
 log = logging.getLogger("auth")
 WEBOOK_RECAPTCHA_SITE_KEY = "6LcvYHooAAAAAC-G46bpymJKtIwfDQpg9DsHPMpL"
@@ -78,18 +81,78 @@ def _proxy_config() -> Optional[dict[str, str]]:
 
 
 async def login_account(account_id: str, notifier=None, max_attempts: int = 2) -> dict[str, Any]:
-    if _playwright_err is not None:
-        return {"ok": False, "error": f"Browser backend unavailable: {_playwright_err}"}
+    """V15.1 — HTTP-only login via login_robust (curl_cffi + 2Captcha).
 
+    Falls back to the legacy Playwright path ONLY if the robust path
+    fails AND a browser backend is available. The fallback is mainly
+    there for diagnostics; in production the robust path always wins.
+    """
     acc = get_account(account_id)
     if not acc:
         return {"ok": False, "error": "الحساب غير موجود"}
 
+    proxy_url = (acc.get("proxy_url") or "").strip() or None
     last_error = ""
+
+    # ─── PRIMARY PATH: HTTP-only via login_robust (V15.1) ───
     for attempt in range(1, max_attempts + 1):
-        log.info(f"🔐 {_pw_backend} login attempt {attempt}/{max_attempts} for {account_id}")
+        log.info(
+            f"🔐 robust(http) login attempt {attempt}/{max_attempts} "
+            f"for {account_id}"
+        )
         set_account_status(account_id, "refreshing")
         try:
+            res = await _robust_login(
+                email=acc["email"],
+                password=acc["password"],
+                captcha_api_key=two_captcha_api_key().strip() or None,
+                proxy_url=proxy_url,
+                prefer="recaptcha",
+                lang=WEBOOK_LANG or "ar",
+            )
+            if res.ok and res.access_token:
+                save_tokens(
+                    account_id=account_id,
+                    access=res.access_token,
+                    refresh="",
+                    expires_at=res.expires_at
+                        or int(time.time() + 7 * 86400),
+                    user_id=res.user_id,
+                )
+                log.info(
+                    f"✅ robust login OK for {account_id} "
+                    f"(captcha={res.captcha_kind}, "
+                    f"elapsed={res.elapsed_ms:.0f} ms)"
+                )
+                return {
+                    "ok": True,
+                    "tokens": {
+                        "access_token": res.access_token,
+                        "expires_at": res.expires_at,
+                        "user_id": res.user_id,
+                    },
+                    "user": {
+                        "name": res.user_name or "",
+                        "email": acc["email"],
+                    },
+                    "meta": {
+                        "path": "robust_http",
+                        "captcha_kind": res.captcha_kind,
+                        "elapsed_ms": res.elapsed_ms,
+                    },
+                }
+            last_error = res.error or f"robust login failed (http={res.http_status})"
+            log.warning(f"robust login attempt {attempt} failed: {last_error}")
+        except Exception as e:
+            last_error = f"robust login crashed: {str(e)[:200]}"
+            log.exception(f"robust login crashed for {account_id}")
+        if attempt < max_attempts:
+            await asyncio.sleep(2.0)
+
+    # ─── FALLBACK PATH: legacy Playwright (only if available) ───
+    if _playwright_err is None:
+        try:
+            log.info(f"🔀 falling back to Playwright login for {account_id}")
             result = await _do_login_once(acc["email"], acc["password"])
             if result.get("ok"):
                 save_tokens(
@@ -107,13 +170,12 @@ async def login_account(account_id: str, notifier=None, max_attempts: int = 2) -
                         "user_id": result.get("user_id"),
                     },
                     "user": result.get("user") or {},
+                    "meta": {"path": "playwright_fallback"},
                 }
-            last_error = result.get("error", "غير معروف")
+            last_error = result.get("error", last_error or "غير معروف")
         except Exception as e:
-            last_error = str(e)[:250]
-            log.exception(f"login attempt crashed for {account_id}")
-        if attempt < max_attempts:
-            await asyncio.sleep(2.5)
+            last_error = f"playwright fallback crashed: {str(e)[:200]}"
+            log.exception(f"playwright fallback crashed for {account_id}")
 
     set_account_status(account_id, "needs_relogin", last_error[:300])
     return {"ok": False, "error": last_error}

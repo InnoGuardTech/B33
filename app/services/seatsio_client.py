@@ -41,10 +41,12 @@ import time
 from typing import Any, Optional
 from urllib.parse import urlencode
 
-import aiohttp
+import aiohttp  # retained ONLY for WebSocket message-type enums
 
 from app.core.config import WEBOOK_API, WEBOOK_ORIGIN
+from app.services.login_robust import resolve_public_token
 from app.services.seatsio_token_fetcher import ensure_tokens
+from app.services.stealth_client import StealthClient
 
 log = logging.getLogger("seatsio_client")
 
@@ -102,8 +104,19 @@ def _legacy_headers(hold_token: str = "") -> dict[str, str]:
     return h
 
 
-async def _read_json(resp: aiohttp.ClientResponse) -> Any:
-    """Read possibly-gzipped JSON safely."""
+async def _read_json(resp) -> Any:
+    """Read possibly-gzipped JSON from EITHER aiohttp.ClientResponse
+    OR a curl_cffi response. Both expose .read() / .text / .json()."""
+    # curl_cffi path: the response body is already decoded.
+    if hasattr(resp, "json") and not hasattr(resp, "_payload"):
+        try:
+            return resp.json()
+        except Exception:
+            try:
+                return {"raw": (resp.text or "")[:500]}
+            except Exception:
+                return None
+    # aiohttp path (legacy)
     raw = await resp.read()
     if raw[:2] == b"\x1f\x8b":
         try:
@@ -145,20 +158,25 @@ async def _post_hold_token_once(
         "referer": f"{WEBOOK_ORIGIN}/",
         "authorization": f"Bearer {bearer}",
     }
+    # V15-final: builtin-fallback aware public token
     try:
         from app.core.config import webook_public_token
-        headers["token"] = webook_public_token()
+        headers["token"] = resolve_public_token(webook_public_token() or "")
     except Exception:
-        pass
+        headers["token"] = resolve_public_token("")
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                meta["http_status"] = r.status
-                d = await _read_json(r) or {}
+        # V15-final: stealth POST via curl_cffi (matches Chrome JA3+H2)
+        async with StealthClient(timeout=15.0) as cli:
+            r = await cli.request("POST", url, headers=headers, json=body)
+            meta["http_status"] = r.status_code
+            try:
+                d = r.json() or {}
+            except Exception:
+                try:
+                    d = {"raw": (r.text or "")[:500]}
+                except Exception:
+                    d = {}
 
         if isinstance(d, dict) and d.get("errors", {}).get("turnstile"):
             meta["turnstile_required"] = True
@@ -572,7 +590,8 @@ class SeatsioClient:
         # v8: chart-layer Turnstile token — some webook deployments require
         # one even when fetching the chart map (not just the hold-token).
         self.turnstile_token = turnstile_token or ""
-        self.session: Optional[aiohttp.ClientSession] = None
+        # V15-final: session is now a StealthClient (curl_cffi).
+        self.session: Optional[StealthClient] = None
         self._ws_task: Optional[asyncio.Task] = None
         # Cached normalised payload
         self._cached_event: dict = {}
@@ -591,7 +610,12 @@ class SeatsioClient:
                 self.workspace_key = tokens.get("workspace_key") or ""
             except Exception:
                 pass
-        self.session = aiohttp.ClientSession(auto_decompress=True)
+        # V15-final: stealth session per client instance (curl_cffi)
+        self.session = StealthClient(
+            fingerprint_seed=f"sio:{self.event_key[:16]}",
+            timeout=20.0,
+        )
+        await self.session._ensure_session()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -600,15 +624,20 @@ class SeatsioClient:
         if self.session:
             await self.session.close()
 
-    # ── HTTP helpers ──
+    # ── HTTP helpers (V15-final — curl_cffi) ──
     async def _get(self, url: str, *, headers: dict, timeout: int = 15) -> tuple[int, Any]:
         try:
-            async with self.session.get(
-                url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                d = await _read_json(r)
-                return r.status, d
+            r = await self.session.request(
+                "GET", url, headers=headers, timeout=float(timeout),
+            )
+            try:
+                d = r.json()
+            except Exception:
+                try:
+                    d = {"raw": (r.text or "")[:500]}
+                except Exception:
+                    d = None
+            return r.status_code, d
         except Exception as e:
             log.debug(f"GET {url[:120]} → {e}")
             return 0, {"error": str(e)[:200]}
@@ -616,12 +645,18 @@ class SeatsioClient:
     async def _post(self, url: str, *, headers: dict, body: dict,
                     timeout: int = 15) -> tuple[int, Any]:
         try:
-            async with self.session.post(
-                url, headers=headers, json=body,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                d = await _read_json(r)
-                return r.status, d
+            r = await self.session.request(
+                "POST", url, headers=headers, json=body,
+                timeout=float(timeout),
+            )
+            try:
+                d = r.json()
+            except Exception:
+                try:
+                    d = {"raw": (r.text or "")[:500]}
+                except Exception:
+                    d = None
+            return r.status_code, d
         except Exception as e:
             log.debug(f"POST {url[:120]} → {e}")
             return 0, {"error": str(e)[:200]}

@@ -1,17 +1,17 @@
 """
-Webook.com REST API client — HTTP only (no browser).
+Webook.com REST API client — V15-final, curl_cffi (StealthClient).
+
+Migrated from aiohttp to the V14.1 StealthClient so the TLS/JA3 + HTTP/2
+fingerprint matches a real Chrome and Cloudflare's WAF stops returning
+silent 403s on event-detail / ticket-details.
 
 Validated against live webook.com traffic:
-  • GET  /api/v2/event-detail/{slug}       -> rich event metadata (title, ...)
-  • GET  /api/v2/event-ticket-details/{slug}  -> ticket categories & prices
-  • GET  /api/v2/currencies                -> currency list
-  • POST /api/v2/login                     -> {email,password,captcha,lang}
+  • GET  /api/v2/event-detail/{slug}              → rich event metadata
+  • GET  /api/v2/event-ticket-details/{slug}      → ticket categories & prices
+  • GET  /api/v2/currencies                       → currency list
+  • POST /api/v2/login                            → see login_robust.py
 
-Booking endpoints: Webook's booking API is not publicly documented. The
-non-seated flow relies on UI interactions to create a cart, and the seated
-flow integrates with seats.io. Until we reverse-engineer the exact payload
-shape, live bookings are executed through Playwright (see
-booking_orchestrator.py).
+Booking endpoints: see booking_orchestrator.py / booking_http.py.
 """
 from __future__ import annotations
 
@@ -19,54 +19,71 @@ import json
 import logging
 from typing import Any, Optional
 
-import aiohttp
-
 from app.core.config import WEBOOK_API, WEBOOK_LANG, WEBOOK_PUBLIC_TOKEN
+from app.services.login_robust import resolve_public_token
+from app.services.stealth_client import StealthClient
 
 log = logging.getLogger("webook_api")
 
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
-)
 
-BASE_HEADERS = {
-    "accept": "application/json",
-    "content-type": "application/json",
-    "user-agent": DEFAULT_UA,
-    "origin": "https://webook.com",
-    "referer": "https://webook.com/",
-}
+def _resolved_token() -> str:
+    """Resolve the public 'token' header value at call time.
+
+    Honours WEBOOK_PUBLIC_TOKEN_BUILTIN_FALLBACK so /event-detail and
+    /event-ticket-details unblock automatically when the env var is
+    missing or holds the read-only 32-char token.
+    """
+    return resolve_public_token(WEBOOK_PUBLIC_TOKEN or "")
 
 
 def _headers(bearer: Optional[str] = None,
              lang: Optional[str] = None) -> dict[str, str]:
-    h = dict(BASE_HEADERS)
-    h["token"] = WEBOOK_PUBLIC_TOKEN
-    h["authorization"] = f"Bearer {bearer}" if bearer else "Bearer"
-    h["accept-language"] = lang or WEBOOK_LANG
-    return h
+    return {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://webook.com",
+        "referer": "https://webook.com/",
+        "token": _resolved_token(),
+        "authorization": f"Bearer {bearer}" if bearer else "Bearer",
+        "accept-language": lang or WEBOOK_LANG,
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
 
 
-async def _json(session: aiohttp.ClientSession, method: str, url: str,
+async def _json(method: str, url: str,
                 *, bearer: Optional[str] = None,
                 json_body: Optional[dict] = None,
-                timeout: int = 15,
-                lang: Optional[str] = None) -> tuple[int, Any]:
+                timeout: float = 15.0,
+                lang: Optional[str] = None,
+                proxy_url: Optional[str] = None,
+                fingerprint_seed: Optional[str] = None,
+                ) -> tuple[int, Any]:
+    """Single-request helper — opens a fresh StealthClient per call.
+
+    For high-throughput hot paths the caller should prefer creating one
+    StealthClient and calling .request() repeatedly. This helper is for
+    one-shot reads (event-detail, event-ticket-details, currencies, …).
+    """
     try:
-        async with session.request(
-            method, url,
-            headers=_headers(bearer, lang),
-            json=json_body,
-            timeout=aiohttp.ClientTimeout(total=timeout),
-        ) as r:
-            text = await r.text()
+        async with StealthClient(
+            proxy_url=proxy_url,
+            fingerprint_seed=fingerprint_seed,
+            timeout=timeout,
+        ) as cli:
+            r = await cli.request(
+                method.upper(), url,
+                headers=_headers(bearer, lang),
+                json=json_body,
+            )
             try:
-                data = await r.json(content_type=None)
+                data = r.json()
             except Exception:
-                data = {"raw": text[:600]}
-            return r.status, data
+                try:
+                    data = {"raw": (r.text or "")[:600]}
+                except Exception:
+                    data = {"raw": ""}
+            return r.status_code, data
     except Exception as e:
         log.debug(f"HTTP {method} {url} -> {e}")
         return 0, {"error": str(e)}
@@ -79,14 +96,13 @@ async def get_event_detail(slug: str,
                            lang: Optional[str] = None,
                            bearer: Optional[str] = None
                            ) -> Optional[dict[str, Any]]:
-    async with aiohttp.ClientSession() as s:
-        status, data = await _json(
-            s, "GET",
-            f"{WEBOOK_API}/event-detail/{slug}"
-            f"?lang={lang or WEBOOK_LANG}&visible_in=rs",
-            bearer=bearer,
-            lang=lang,
-        )
+    status, data = await _json(
+        "GET",
+        f"{WEBOOK_API}/event-detail/{slug}"
+        f"?lang={lang or WEBOOK_LANG}&visible_in=rs",
+        bearer=bearer,
+        lang=lang,
+    )
     if status == 200 and isinstance(data, dict):
         return data.get("data")
     return None
@@ -95,18 +111,16 @@ async def get_event_detail(slug: str,
 async def get_event_tickets(slug: str,
                             lang: Optional[str] = None,
                             bearer: Optional[str] = None) -> dict[str, Any]:
+    """Returns:
+        {"event": {...}, "tickets": [normalised dicts], "is_seated": bool}
     """
-    Returns:
-      {"event": {...}, "tickets": [normalised dicts], "is_seated": bool}
-    """
-    async with aiohttp.ClientSession() as s:
-        status, data = await _json(
-            s, "GET",
-            f"{WEBOOK_API}/event-ticket-details/{slug}"
-            f"?lang={lang or WEBOOK_LANG}&visible_in=rs&page=1",
-            bearer=bearer,
-            lang=lang,
-        )
+    status, data = await _json(
+        "GET",
+        f"{WEBOOK_API}/event-ticket-details/{slug}"
+        f"?lang={lang or WEBOOK_LANG}&visible_in=rs&page=1",
+        bearer=bearer,
+        lang=lang,
+    )
     if status != 200 or not isinstance(data, dict):
         return {}
 
@@ -125,7 +139,6 @@ async def get_event_tickets(slug: str,
 # Helpers
 # ════════════════════════════════════════════════════════════════════════
 def _f(v, default: float = 0.0) -> float:
-    """Cast possibly-string numbers to float safely."""
     if v is None or v == "":
         return default
     try:
@@ -135,15 +148,6 @@ def _f(v, default: float = 0.0) -> float:
 
 
 def _normalize_ticket(t: dict) -> dict:
-    """Normalise a raw webook ticket, exposing a meaningful display price.
-
-    Webook quotes ``price`` as the NET amount (excl. VAT). The total
-    charged to the user on webook.com is ``price + vat`` — that's what we
-    expose as ``price_with_vat`` and ``display_price``.
-
-    For subscription-gated tickets where ``price`` is zero, fall back to
-    ``subscription_ticket_type.price`` (if present).
-    """
     price_net = _f(t.get("price"))
     original_price = _f(t.get("original_price"))
     vat = _f(t.get("vat"))

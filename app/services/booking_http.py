@@ -1,7 +1,12 @@
 """
 Direct HTTP booking engine — fast path for Webook.
 
-v4 enhancements:
+V15-final: every outbound HTTP call now goes through ``StealthClient``
+(curl_cffi). aiohttp is retained ONLY for the cookie jar / session
+plumbing required by the Cloudflare-WAF browser fallback path; no actual
+request is sent over aiohttp anymore.
+
+v4 enhancements (kept):
   • per-event primary + backup block selection (was: global TARGET_BLOCKS)
   • geometric neighbor expansion when all chosen blocks are full
   • drop-watcher integration when chart is fully booked
@@ -13,7 +18,7 @@ import logging
 import time
 from typing import Any, Optional
 
-import aiohttp
+import aiohttp  # retained for CookieJar plumbing only
 
 from app.core.config import (
     WEBOOK_API,
@@ -32,6 +37,8 @@ from app.services.seatsio_runtime import ensure_event_warm, get_snapshot
 from app.services.block_analyzer import (
     extract_blocks, find_seats_with_fallback, chart_is_sold_out,
 )
+from app.services.login_robust import resolve_public_token
+from app.services.stealth_client import StealthClient
 
 log = logging.getLogger("booking_http")
 
@@ -48,13 +55,19 @@ SEATED_EVENT_KEY_CANDIDATES = {
 
 
 def build_headers(bearer: str, lang: str = "en") -> dict[str, str]:
+    """Headers for the booking hot path.
+
+    V15-final: ``token`` resolves at call time so the bundled fallback
+    (``WEBOOK_PUBLIC_TOKEN_BUILTIN_FALLBACK``) kicks in automatically when
+    the env var is missing or is the read-only 32-char token.
+    """
     return {
         "accept": "application/json",
         "content-type": "application/json",
         "user-agent": DEFAULT_UA,
         "accept-language": "ar-SA",
         "authorization": f"Bearer {bearer}" if bearer else "Bearer",
-        "token": WEBOOK_PUBLIC_TOKEN,
+        "token": resolve_public_token(WEBOOK_PUBLIC_TOKEN or ""),
         "origin": WEBOOK_ORIGIN,
         "referer": f"{WEBOOK_ORIGIN}/",
         "sec-ch-ua": '"Not:A-Brand";v="99", "Chromium";v="128"',
@@ -63,28 +76,41 @@ def build_headers(bearer: str, lang: str = "en") -> dict[str, str]:
     }
 
 
-async def _get(session: aiohttp.ClientSession, url: str, bearer: str, timeout: int = 15) -> tuple[int, Any]:
+# V15-final: Stealth I/O. The legacy aiohttp.ClientSession parameter is
+# kept on every public function so we don't have to touch the giant
+# orchestration code below — it's now an unused placeholder.
+async def _stealth_request(
+    method: str, url: str, bearer: str,
+    *, body: Optional[dict] = None, timeout: float = 15.0,
+    cookies: Any = None,
+) -> tuple[int, Any]:
     try:
-        async with session.get(url, headers=build_headers(bearer), timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+        async with StealthClient(timeout=timeout) as cli:
+            r = await cli.request(
+                method.upper(), url,
+                headers=build_headers(bearer),
+                json=body, cookies=cookies,
+            )
             try:
-                data = await r.json(content_type=None)
+                data = r.json()
             except Exception:
-                data = {"raw": (await r.text())[:1200]}
-            return r.status, data
+                try:
+                    data = {"raw": (r.text or "")[:1200]}
+                except Exception:
+                    data = {"raw": ""}
+            return r.status_code, data
     except Exception as e:
         return 0, {"error": str(e)[:200]}
 
 
-async def _post(session: aiohttp.ClientSession, url: str, bearer: str, body: dict, timeout: int = 25) -> tuple[int, Any]:
-    try:
-        async with session.post(url, headers=build_headers(bearer), json=body, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            try:
-                data = await r.json(content_type=None)
-            except Exception:
-                data = {"raw": (await r.text())[:1200]}
-            return r.status, data
-    except Exception as e:
-        return 0, {"error": str(e)[:200]}
+async def _get(session, url: str, bearer: str, timeout: int = 15) -> tuple[int, Any]:
+    return await _stealth_request("GET", url, bearer, timeout=float(timeout))
+
+
+async def _post(session, url: str, bearer: str, body: dict, timeout: int = 25) -> tuple[int, Any]:
+    return await _stealth_request(
+        "POST", url, bearer, body=body, timeout=float(timeout),
+    )
 
 
 def _deep_find_first(obj: Any, keys: set[str]) -> Any:
@@ -236,13 +262,13 @@ async def resolve_seated_manifest(
 async def prewarm_event_from_slug(slug: str, ticket_id: str = "") -> None:
     if not seatsio_enabled() or not slug:
         return
-    async with aiohttp.ClientSession() as session:
-        meta = await fetch_event_meta(session, slug, "")
-        if not meta.get("is_seated"):
-            return
-        manifest = await resolve_seated_manifest(session, slug, ticket_id, "", event_meta=meta)
-        if manifest.get("event_key"):
-            await ensure_event_warm(manifest["event_key"])
+    # V15-final: stealth-only path. We pass None for the unused session arg.
+    meta = await fetch_event_meta(None, slug, "")
+    if not meta.get("is_seated"):
+        return
+    manifest = await resolve_seated_manifest(None, slug, ticket_id, "", event_meta=meta)
+    if manifest.get("event_key"):
+        await ensure_event_warm(manifest["event_key"])
 
 
 async def fetch_timeslot_id(session: aiohttp.ClientSession, slug: str, date_str: str, ticket_id: str, bearer: str) -> Optional[str]:
@@ -294,14 +320,13 @@ async def add_to_cart(
     return False, data
 
 
-async def clear_cart(session: aiohttp.ClientSession, parent_event_id: str, bearer: str) -> None:
+async def clear_cart(session, parent_event_id: str, bearer: str) -> None:
     for url in [
         f"{WEBOOK_API}/cart/clear?lang=en&parent_event_id={parent_event_id}",
         f"{WEBOOK_API}/cart/clear-cart?lang=en&parent_event_id={parent_event_id}",
     ]:
         try:
-            async with session.post(url, headers=build_headers(bearer), timeout=aiohttp.ClientTimeout(total=8)):
-                pass
+            await _stealth_request("POST", url, bearer, body={}, timeout=8.0)
         except Exception:
             pass
 
@@ -325,20 +350,17 @@ async def force_purge_cart(session: aiohttp.ClientSession, parent_event_id: str,
             f"{WEBOOK_API}/cart/clear-cart?lang=en&parent_event_id={parent_event_id}",
         ]:
             try:
-                async with session.post(url, headers=build_headers(bearer),
-                                         timeout=aiohttp.ClientTimeout(total=8)):
-                    pass
+                await _stealth_request("POST", url, bearer, body={}, timeout=8.0)
             except Exception:
                 pass
 
         # Read current cart state
         try:
-            async with session.get(
+            _status, d = await _stealth_request(
+                "GET",
                 f"{WEBOOK_API}/cart?lang=en&parent_event_id={parent_event_id}",
-                headers=build_headers(bearer),
-                timeout=aiohttp.ClientTimeout(total=8),
-            ) as r:
-                d = await r.json(content_type=None)
+                bearer, timeout=8.0,
+            )
         except Exception:
             d = {}
         cart = (d or {}).get("data") or {}
@@ -361,13 +383,12 @@ async def force_purge_cart(session: aiohttp.ClientSession, parent_event_id: str,
                 (f"{WEBOOK_API}/cart/remove-item?lang=en&item_id={item_id}", "POST"),
             ]:
                 try:
-                    async with session.request(
-                        method, url, headers=build_headers(bearer),
-                        timeout=aiohttp.ClientTimeout(total=6),
-                    ) as r:
-                        if r.status in (200, 204):
-                            state["items_deleted"] += 1
-                            break
+                    status, _d = await _stealth_request(
+                        method, url, bearer, body={}, timeout=6.0,
+                    )
+                    if status in (200, 204):
+                        state["items_deleted"] += 1
+                        break
                 except Exception:
                     pass
 
@@ -378,11 +399,7 @@ async def force_purge_cart(session: aiohttp.ClientSession, parent_event_id: str,
                 (f"{WEBOOK_API}/carts/{cart_id}?lang=en", "DELETE"),
             ]:
                 try:
-                    async with session.request(
-                        method, url, headers=build_headers(bearer),
-                        timeout=aiohttp.ClientTimeout(total=6),
-                    ):
-                        pass
+                    await _stealth_request(method, url, bearer, body={}, timeout=6.0)
                 except Exception:
                     pass
 
