@@ -25,6 +25,24 @@ from app.services.stealth_client import StealthClient
 
 log = logging.getLogger("webook_api")
 
+# V15-final: kept as a module-level constant so legacy callers that import
+# `BASE_HEADERS` (e.g. event_discovery.py) keep working. The actual hot-path
+# headers are built per-request by `_headers()` below, which honours the
+# V15.1 builtin-fallback public token.
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+BASE_HEADERS: dict[str, str] = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "user-agent": DEFAULT_UA,
+    "origin": "https://webook.com",
+    "referer": "https://webook.com/",
+}
+
 
 def _resolved_token() -> str:
     """Resolve the public 'token' header value at call time.
@@ -38,17 +56,13 @@ def _resolved_token() -> str:
 
 def _headers(bearer: Optional[str] = None,
              lang: Optional[str] = None) -> dict[str, str]:
-    return {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "origin": "https://webook.com",
-        "referer": "https://webook.com/",
-        "token": _resolved_token(),
-        "authorization": f"Bearer {bearer}" if bearer else "Bearer",
-        "accept-language": lang or WEBOOK_LANG,
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-    }
+    h = dict(BASE_HEADERS)
+    h["token"] = _resolved_token()
+    h["authorization"] = f"Bearer {bearer}" if bearer else "Bearer"
+    h["accept-language"] = lang or WEBOOK_LANG
+    h["sec-fetch-mode"] = "cors"
+    h["sec-fetch-site"] = "same-site"
+    return h
 
 
 async def _json(method: str, url: str,
