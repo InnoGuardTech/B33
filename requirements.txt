@@ -7,3 +7,6 @@ pydantic==2.9.2
 libsql-client==0.3.1
 psycopg2-binary==2.9.9
 python-multipart==0.0.12
+# V14: HTTP/2-native stealth client (replaces aiohttp on the hot booking path)
+httpx[http2]==0.27.2
+h2==4.1.0

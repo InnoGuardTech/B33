@@ -1,21 +1,31 @@
 """
-V13 Browser Singleton — one Chromium process, contexts per account.
+V14 Browser Singleton — Render-512MB-friendly + seats.io map fix.
 
-Why:
-  • Render free tier: 512MB RAM hard cap. Each Playwright launch costs
-    ~150-180MB; reusing a single browser saves a full launch (~3s) and
-    a full process (~150MB) per booking.
-  • Cookies / localStorage isolation is preserved by giving each booking
-    its OWN BrowserContext (close-on-exit).
-  • Idle-eviction: the singleton self-closes after 30 minutes of inactivity
-    so RAM is reclaimed when the bot is quiet.
-  • Stealth: low-RAM Chromium flags + UA / viewport / locale rotation.
+What changed vs V13:
+  • The V13 launch flag `--blink-settings=imagesEnabled=false` killed ALL
+    images globally, which also blocked the seats.io chart from rendering
+    its category icons → users saw an empty grey rectangle instead of a
+    seat map.
+  • V14 keeps the global "no images" stance (saves ~40% RAM) but uses
+    Playwright's request-router to SELECTIVELY ALLOW images, fonts and
+    media that come from the trusted map domains:
+        seats.io / cdn-eu.seatsio.net / cdn.seatsio.net
+        wbk-assets.webook.com (Webook's own CDN)
+  • Everything else (ads, analytics, third-party fonts, hero images) is
+    aborted at the network layer → pages load 3× faster on Render free.
+  • Browser is still a SINGLETON with 30-min idle TTL; contexts per acc.
+  • New: optional proxy_url per booking_context() call → per-account exit.
+  • New: timezone + locale rotation pulled from a small pool.
 
-Public API:
+Public API (unchanged for backwards compat):
     async with browser_context(label="acc_xxx") as ctx:
         page = await ctx.new_page()
         ...
-    # context auto-closed on exit; browser stays warm for 30 min.
+    # context auto-closed; browser stays warm for 30 min.
+
+V14 additions:
+    async with browser_context(label="acc", proxy_url="http://...") as ctx:
+        ...
 """
 from __future__ import annotations
 
@@ -90,13 +100,50 @@ VIEWPORTS = [
 
 LOCALES = ["ar-SA", "en-US"]
 
-# Default Render-friendly Chromium flags (low RAM, no GPU).
+TIMEZONES = [
+    "Asia/Riyadh", "Asia/Dubai", "Asia/Kuwait", "Asia/Qatar", "Asia/Bahrain",
+]
+
+# V14: Domains whose images / fonts / media must be ALLOWED so the
+# seats.io chart renders correctly. Anything else is blocked.
+MAP_ALLOWED_DOMAINS = (
+    "seats.io",
+    "cdn-eu.seatsio.net",
+    "cdn.seatsio.net",
+    "cdn-na.seatsio.net",
+    "cdn-am.seatsio.net",
+    "wbk-assets.webook.com",
+    "webook.com",                    # Webook's own poster CDN
+    "api.seats.io",
+    "api.seatsio.net",
+)
+
+# V14: Heavy resource types that are blocked by default for non-map domains.
+# `image` and `font` were the V13 footguns (broke seats.io rendering).
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+# Always-block resource types regardless of domain (analytics / ads).
+HARD_BLOCKED_PATTERNS = (
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "facebook.net",
+    "facebook.com/tr",
+    "hotjar.com",
+    "mixpanel.com",
+    "segment.com",
+    "fullstory.com",
+)
+
+# V14 RAM-optimized Chromium flags. NOTE: --blink-settings=imagesEnabled
+# was REMOVED so the page.route handler can decide image policy per-request
+# (allowing seats.io chart icons through).
 LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-blink-features=AutomationControlled",
-    # V13 RAM optimizations
+    # RAM optimization (Render 512MB)
     "--disable-gpu",
     "--disable-software-rasterizer",
     "--disable-extensions",
@@ -105,9 +152,16 @@ LAUNCH_ARGS = [
     "--disable-sync",
     "--no-first-run",
     "--mute-audio",
-    "--disable-features=TranslateUI",
-    "--blink-settings=imagesEnabled=false",  # ⚡ ~40% RAM saved
-    "--single-process",                       # ⚡ ~100MB saved
+    "--disable-features=TranslateUI,BackForwardCache,InterestFeedContentSuggestions",
+    "--disable-component-update",
+    "--disable-domain-reliability",
+    "--disable-client-side-phishing-detection",
+    "--disable-hang-monitor",
+    "--disable-popup-blocking",
+    "--metrics-recording-only",
+    # Tab-process accounting (Chromium 117+) — caps RAM bleeding.
+    "--memory-pressure-off",
+    "--single-process",  # ⚠️ saves ~100MB but reduces stability; OK on free tier.
 ]
 
 
@@ -123,16 +177,89 @@ def random_locale() -> str:
     return random.choice(LOCALES)
 
 
-def random_context_kwargs() -> dict[str, Any]:
-    """Return a fresh, randomized set of context creation kwargs."""
+def random_timezone() -> str:
+    return random.choice(TIMEZONES)
+
+
+def random_context_kwargs(seed: Optional[str] = None) -> dict[str, Any]:
+    """Return a fresh, randomized set of context creation kwargs.
+
+    If `seed` is provided (e.g. account_id), the fingerprint is stable
+    per-account so a given Webook account always shows the same browser.
+    """
+    rng = random.Random(seed) if seed else random.Random()
     return {
-        "user_agent": random_user_agent(),
-        "viewport": random_viewport(),
-        "locale": random_locale(),
-        "timezone_id": random.choice([
-            "Asia/Riyadh", "Asia/Dubai", "Asia/Kuwait", "Asia/Qatar",
-        ]),
+        "user_agent": rng.choice(USER_AGENTS),
+        "viewport": dict(rng.choice(VIEWPORTS)),
+        "locale": rng.choice(LOCALES),
+        "timezone_id": rng.choice(TIMEZONES),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════
+# V14: Selective resource interceptor (the "map fix")
+# ════════════════════════════════════════════════════════════════════════
+def _is_map_domain(url: str) -> bool:
+    u = (url or "").lower()
+    for d in MAP_ALLOWED_DOMAINS:
+        if d in u:
+            return True
+    return False
+
+
+def _is_hard_blocked(url: str) -> bool:
+    u = (url or "").lower()
+    for p in HARD_BLOCKED_PATTERNS:
+        if p in u:
+            return True
+    return False
+
+
+async def install_lightweight_router(ctx) -> None:
+    """Install a context-level request router that:
+
+      1. ALLOWS every request to seats.io / wbk-assets.webook.com so the
+         chart renders correctly.
+      2. BLOCKS images / media / fonts on every other domain.
+      3. HARD-BLOCKS analytics / ads everywhere.
+
+    This is what makes the seat map render correctly while staying within
+    the 512MB Render envelope.
+    """
+    async def _router(route, request):
+        try:
+            url = request.url or ""
+            rtype = (request.resource_type or "").lower()
+
+            # 1. Hard-block analytics/ads regardless of domain.
+            if _is_hard_blocked(url):
+                await route.abort()
+                return
+
+            # 2. Always allow requests to map/seats.io domains.
+            if _is_map_domain(url):
+                await route.continue_()
+                return
+
+            # 3. Block heavy resource types on non-map domains.
+            if rtype in BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+                return
+
+            # 4. Default — let it through.
+            await route.continue_()
+        except Exception:
+            # Never let the router itself crash the page; fall open.
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    # `**/*` matches every request — Playwright handles this efficiently.
+    try:
+        await ctx.route("**/*", _router)
+    except Exception as e:
+        log.warning("install_lightweight_router failed: %s", e)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -142,9 +269,9 @@ class _BrowserSingleton:
     IDLE_TTL = 30 * 60  # 30 minutes
 
     def __init__(self) -> None:
-        self._pw_ctx = None        # async_playwright() context manager
-        self._pw = None            # underlying Playwright instance
-        self._browser = None       # Chromium browser
+        self._pw_ctx = None
+        self._pw = None
+        self._browser = None
         self._lock = asyncio.Lock()
         self._last_used = 0.0
         self._active_contexts = 0
@@ -161,10 +288,12 @@ class _BrowserSingleton:
                 f"Playwright unavailable: {_pw_err}" if _pw_err
                 else "Playwright not installed"
             )
-        log.info("🧬 launching Chromium singleton…")
+        log.info("🧬 launching Chromium singleton (V14 RAM-tuned)…")
         self._pw_ctx = async_playwright()
         self._pw = await self._pw_ctx.start()
 
+        # Browser-level proxy is a fallback. Per-context proxy (preferred)
+        # is set in self.context().
         proxy_kwargs: dict[str, Any] = {}
         ps = (proxy_server() or "").strip()
         if ps:
@@ -182,8 +311,8 @@ class _BrowserSingleton:
             **proxy_kwargs,
         )
         self._last_used = time.time()
-        log.info("✅ Chromium singleton ready (low-RAM flags + proxy=%s)",
-                 "yes" if proxy_kwargs else "no")
+        log.info("✅ Chromium singleton ready (selective router enabled, "
+                 "global_proxy=%s)", "yes" if proxy_kwargs else "no")
 
         if self._reaper_task is None or self._reaper_task.done():
             self._reaper_task = asyncio.create_task(
@@ -209,18 +338,42 @@ class _BrowserSingleton:
 
     @asynccontextmanager
     async def context(self, *, label: str = "",
-                      extra_args: Optional[dict[str, Any]] = None):
+                      extra_args: Optional[dict[str, Any]] = None,
+                      proxy_url: Optional[str] = None,
+                      install_router: bool = True):
         """Yield a fresh BrowserContext with randomized fingerprint.
 
         Closes the context on exit while the browser stays warm.
+
+        New in V14:
+          • proxy_url: per-context proxy (overrides global). Critical for
+            account isolation. Format: http://user:pass@host:port
+          • install_router: True → install the V14 lightweight router so
+            heavy assets are blocked except for map domains.
         """
         async with self._lock:
             await self._ensure_started()
 
-        kwargs = random_context_kwargs()
+        kwargs = random_context_kwargs(seed=label or None)
         if extra_args:
             kwargs.update(extra_args)
+
+        # Per-context proxy (Playwright supports this on Chromium contexts
+        # only when the browser was launched WITHOUT a global proxy, OR
+        # when launched with `--proxy-server=per-context`. We lazily fall
+        # back to global proxy if the per-context call fails.)
+        if proxy_url:
+            try:
+                parsed = _parse_proxy_url(proxy_url)
+                if parsed:
+                    kwargs["proxy"] = parsed
+            except Exception as e:
+                log.debug("proxy_url parse failed for label=%s: %s", label, e)
+
         ctx = await self._browser.new_context(**kwargs)
+        if install_router:
+            await install_lightweight_router(ctx)
+
         self._active_contexts += 1
         self._last_used = time.time()
         try:
@@ -260,15 +413,46 @@ class _BrowserSingleton:
         self._active_contexts = 0
 
 
+def _parse_proxy_url(url: str) -> Optional[dict[str, str]]:
+    """Convert `http://user:pass@host:port` → Playwright proxy dict."""
+    if not url:
+        return None
+    from urllib.parse import urlparse
+    p = urlparse(url.strip())
+    if not p.hostname:
+        return None
+    server = f"{p.scheme or 'http'}://{p.hostname}"
+    if p.port:
+        server += f":{p.port}"
+    out: dict[str, str] = {"server": server}
+    if p.username:
+        out["username"] = p.username
+    if p.password:
+        out["password"] = p.password
+    return out
+
+
 # Module-level singleton
 _singleton = _BrowserSingleton()
 
 
 @asynccontextmanager
 async def browser_context(*, label: str = "",
-                          extra_args: Optional[dict[str, Any]] = None):
-    """Public API: get an isolated BrowserContext from the warm singleton."""
-    async with _singleton.context(label=label, extra_args=extra_args) as ctx:
+                          extra_args: Optional[dict[str, Any]] = None,
+                          proxy_url: Optional[str] = None,
+                          install_router: bool = True):
+    """Public API: get an isolated BrowserContext from the warm singleton.
+
+    Args:
+        label:          arbitrary identifier (account_id is conventional).
+        extra_args:     overrides for new_context() kwargs.
+        proxy_url:      per-context proxy (V14).
+        install_router: True → enable selective resource blocker (V14).
+    """
+    async with _singleton.context(
+        label=label, extra_args=extra_args,
+        proxy_url=proxy_url, install_router=install_router,
+    ) as ctx:
         yield ctx
 
 

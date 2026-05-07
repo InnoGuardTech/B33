@@ -31,6 +31,22 @@ from app.services.booking_http import book_ticket_http
 from app.services.booking_playwright import book_via_browser
 from app.services.distributor import Assignment
 
+# V14: dynamic-secret extraction + HTTP/2 stealth client + per-account proxy.
+# These are imported lazily-friendly so existing modules that import
+# booking_orchestrator do not gain a hard dependency on the new layer.
+try:
+    from app.services.asset_secret_extractor import (
+        get_webook_secrets as _v14_get_secrets,
+        invalidate_cache as _v14_invalidate_secrets,
+    )
+    from app.services.stealth_client import StealthClient as _V14StealthClient
+    _V14_AVAILABLE = True
+except Exception as _e:  # pragma: no cover
+    _v14_get_secrets = None
+    _v14_invalidate_secrets = None
+    _V14StealthClient = None
+    _V14_AVAILABLE = False
+
 log = logging.getLogger("booking")
 
 BookingProgressCB = Callable[[str], Awaitable[None]]
@@ -261,6 +277,25 @@ async def book_one(
                 "failure_kind": "no_account"}
 
     label = acc.get("label") or acc.get("email")
+
+    # V14: refresh dynamic Webook secrets (cached 1h). Cheap on hot path.
+    if _V14_AVAILABLE and _v14_get_secrets is not None:
+        try:
+            v14_secrets = await _v14_get_secrets()
+            if v14_secrets and v14_secrets.is_complete():
+                # Best-effort propagation: stash on the assignment object
+                # so booking_http (via attribute lookup) can pick them up
+                # without a breaking signature change.
+                setattr(assignment, "_v14_secrets", v14_secrets.as_dict())
+        except Exception as _se:
+            log.debug("V14 dynamic secret refresh skipped: %s", _se)
+
+    # V14: per-account proxy URL (read from accounts.proxy_url).
+    proxy_url = (acc.get("proxy_url") or "").strip() or None
+    if proxy_url:
+        log.debug("V14 booking %s via proxy=%s",
+                  assignment.account_id,
+                  proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url)
 
     async def _p(txt: str):
         if progress:

@@ -42,6 +42,11 @@ _V12_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("last_checked_at",  "DOUBLE PRECISION",     "REAL"),
 )
 
+# V14: per-account proxy column (added on `accounts` table).
+_V14_ACCOUNT_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("proxy_url", "TEXT", "TEXT"),
+)
+
 _V12_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_events_royal_cat  ON events(royal_category)",
     "CREATE INDEX IF NOT EXISTS idx_events_avail      ON events(has_availability)",
@@ -109,9 +114,47 @@ def _ensure_event_v12_columns() -> None:
                     con.execute(ix_sql)
                 except Exception:
                     pass
+
+            # V14: per-account proxy_url column.
+            existing_acc: set[str] = set()
+            if backend_name == "postgres":
+                cur = con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'accounts'"
+                )
+                for row in cur.fetchall():
+                    nm = row.get("column_name") if isinstance(row, dict) else row[0]
+                    if nm:
+                        existing_acc.add(nm)
+            else:
+                cur = con.execute("PRAGMA table_info(accounts)")
+                for row in cur.fetchall():
+                    if isinstance(row, dict):
+                        nm = row.get("name") or row.get(1)
+                        if nm:
+                            existing_acc.add(nm)
+                    else:
+                        try:
+                            existing_acc.add(row[1])
+                        except Exception:
+                            pass
+            for col, pg_type, sqlite_type in _V14_ACCOUNT_COLUMNS:
+                if col in existing_acc:
+                    continue
+                ddl = pg_type if backend_name == "postgres" else sqlite_type
+                if backend_name == "postgres":
+                    sql = f"ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {col} {ddl}"
+                else:
+                    sql = f"ALTER TABLE accounts ADD COLUMN {col} {ddl}"
+                try:
+                    con.execute(sql)
+                    log.info(f"[migration V14] accounts.{col} added ({backend_name})")
+                except Exception as e:
+                    log.debug(f"[migration V14] {col}: {e}")
+
         _MIGRATED = True
     except Exception as e:
-        log.error(f"[migration] V12 failed: {e}")
+        log.error(f"[migration] V12/V14 failed: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════

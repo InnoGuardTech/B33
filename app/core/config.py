@@ -235,6 +235,41 @@ def two_captcha_api_key() -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# V14: HTTP/2 + dynamic-secrets + proxy-per-account knobs
+# ════════════════════════════════════════════════════════════════════════
+def enable_http2() -> bool:
+    """V14: master switch for the StealthClient HTTP/2 path."""
+    return _env_bool("V14_ENABLE_HTTP2", True)
+
+
+def use_dynamic_secrets() -> bool:
+    """V14: when True, prefer asset-extracted Webook secrets over env values."""
+    return _env_bool("V14_USE_DYNAMIC_SECRETS", True)
+
+
+def secrets_refresh_interval() -> int:
+    """V14: TTL (seconds) for the dynamic asset-secret cache."""
+    return int(_env_or("V14_SECRETS_TTL", "3600"))
+
+
+def default_proxy_url() -> str:
+    """V14: fallback proxy used when an account has no proxy_url set.
+
+    Format: http[s]://[user:pass@]host:port  (or socks5://...)
+    """
+    return _env_or("V14_DEFAULT_PROXY_URL", "").strip()
+
+
+def stealth_max_connections() -> int:
+    """V14: TCPConnector cap for StealthClient (Render-friendly)."""
+    return int(_env_or("V14_STEALTH_MAX_CONN", "20"))
+
+
+def stealth_max_keepalive() -> int:
+    return int(_env_or("V14_STEALTH_MAX_KEEPALIVE", "8"))
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Backwards-compatible module-level aliases
 # ════════════════════════════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = telegram_bot_token()
