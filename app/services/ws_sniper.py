@@ -1,47 +1,36 @@
 """
-V15 — PHASE 2: SeatIOSniper, the real-time drop-watcher.
+V15.2 — SeatIOSniper: real-time WSS drop watcher with block-targeted filtering.
 
-Listens on the seats.io messaging WebSocket for `objectStatusChanged`
-events with status `available` (a seat just got released — someone's
-hold-token expired or a cart got abandoned). Fires a callback within
-milliseconds so the worker pool (PHASE 3) can race for a hold-token
-before any other booker even sees the seat refresh.
+Listens on the seats.io / seatcloud messaging WebSocket for
+``ObjectStatusChanged`` frames where ``status == "available"`` (a seat
+just got released). Fires a callback within milliseconds so the worker
+pool (PHASE 3) can race for a hold-token before any other booker even
+sees the seat refresh.
 
-Protocol (reverse-engineered from cdn-eu.seatsio.net/chart.js)
--------------------------------------------------------------
-  • Endpoint:  wss://messaging-eu.seatsio.net/ws
-               wss://messaging-na.seatsio.net/ws  (US workspaces)
-               wss://messaging-am.seatsio.net/ws  (LATAM workspaces)
-  • Origin:    https://webook.com  (mirrors the chart-renderer iframe)
-  • Heartbeat: server pushes `[{"type":"PING"}]`; the client must reply
-               with `{"type":"PONG"}` (within ~25 s, otherwise dropped).
-  • Subscribe: `{"type":"subscribe","channel":"events.<event_key>"}`
-               (the event_key is the seats.io chart event id, NOT the
-               webook slug — resolved via the rendering-info JSON).
-  • Frames:    raw JSON; server batches frames into a top-level array.
-               Status messages look like:
-                  {"type":"ObjectStatusChanged",
-                   "objectLabel":"A1-12-5",
-                   "status":"available",
-                   "extraData":{...}}
+V15.2 upgrade
+-------------
+The original V15 sniper subscribed only to ``events.<event_key>``. That
+worked for legacy seatsio events but seats_planner needs a TWO-key
+handshake:
 
-Public API
-----------
-    async with SeatIOSniper(event_key="...") as snip:
-        async for evt in snip.events():
-            if evt.status == "available":
-                await pool.fire(evt.object_label)
+    {
+      "type":  "subscribe",
+      "channel": "events.<event_key>",
+      "chartKey": "<chart_key>",                 # NEW
+      "workspaceKey": "<workspace_key>",         # NEW
+      "token": "<workspace public token>"        # NEW (when present)
+    }
 
-The class is also usable in callback-style:
+The class now also:
 
-    snip = SeatIOSniper(event_key="...", on_drop=async_callback)
-    await snip.start()             # blocks until cancelled
-
-Self-test
----------
-    python -m app.services.ws_sniper [event_key]
-        Establishes the WSS connection, subscribes, and prints the first
-        N frames. Exit code 0 if connection + initial PING received.
+  • Resolves messaging cluster from workspace region when known.
+  • Filters drops by ``target_block_ids`` (set at runtime from Telegram
+    keyboard pick) — only frames whose objectLabel/blockId matches one
+    of the user's chosen blocks fire the on_drop callback. Frames are
+    still enqueued for the consumer iterator (which can do its own
+    filtering for stats).
+  • Exposes ``set_targets(block_ids)`` so handlers.py can update the
+    filter without restarting the WSS connection.
 """
 from __future__ import annotations
 
@@ -49,7 +38,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -67,6 +56,13 @@ WS_ENDPOINTS: tuple[str, ...] = (
     "wss://messaging-oc.seatsio.net/ws",
 )
 
+# seatcloud (Webook's seats_planner cluster) ships its own messaging hub.
+# Some workspaces only publish updates here, so we probe both stacks.
+SEATCLOUD_WS_ENDPOINTS: tuple[str, ...] = (
+    "wss://messaging.seatcloud.com/ws",
+    "wss://api.seatcloud.com/ws",
+)
+
 DEFAULT_HEADERS: dict[str, str] = {
     "Origin": "https://webook.com",
     "User-Agent": (
@@ -81,11 +77,12 @@ DEFAULT_HEADERS: dict[str, str] = {
 # ════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class SeatStatusEvent:
-    """One ObjectStatusChanged frame from the seats.io firehose."""
-    object_label: str          # e.g. "A1-12-5"  (block-row-seat)
-    object_id: str             # internal seats.io UUID
+    """One ObjectStatusChanged frame from the seats.io / seatcloud hose."""
+    object_label: str          # e.g. "130-A-12"  (block-row-seat)
+    object_id: str             # internal seats.io UUID OR seats_planner block id
     status: str                # "available" | "booked" | "reservedByToken" | …
     event_key: str             # the chart event_key
+    block_id: str              # parent block / area id (parsed best-effort)
     extra: dict[str, Any]      # everything else from the raw frame
     raw: dict[str, Any]        # original message (for debugging)
 
@@ -95,26 +92,50 @@ class SeatStatusEvent:
         return self.status.lower() in ("available", "free", "ok")
 
     @classmethod
-    def from_frame(cls, frame: dict, *, event_key: str) -> Optional["SeatStatusEvent"]:
+    def from_frame(
+        cls, frame: dict, *, event_key: str,
+    ) -> Optional["SeatStatusEvent"]:
         """Construct from a single decoded WS frame, or None if irrelevant."""
         if not isinstance(frame, dict):
             return None
         ftype = str(frame.get("type") or "").lower()
-        if ftype not in ("objectstatuschanged", "object_status_changed",
-                         "statuschanged"):
+        if ftype not in (
+            "objectstatuschanged", "object_status_changed",
+            "statuschanged", "objectstatuschange",
+        ):
             return None
+        obj_label = str(
+            frame.get("objectLabel")
+            or frame.get("label")
+            or frame.get("seatLabel")
+            or ""
+        )
+        # Best-effort block id resolution (seats_planner usually sends it
+        # as `parentArea` / `blockId` / `sectionId` / first segment of label).
+        block_id = str(
+            frame.get("blockId")
+            or frame.get("block_id")
+            or frame.get("sectionId")
+            or frame.get("parentArea")
+            or frame.get("areaId")
+            or ""
+        )
+        if not block_id and obj_label:
+            # Labels like "130-A-12" — first hyphen-segment is the block.
+            head = obj_label.split("-", 1)[0].strip()
+            if head:
+                block_id = head
         return cls(
-            object_label=str(
-                frame.get("objectLabel") or frame.get("label") or ""
-            ),
-            object_id=str(
-                frame.get("objectId") or frame.get("id") or ""
-            ),
+            object_label=obj_label,
+            object_id=str(frame.get("objectId") or frame.get("id") or ""),
             status=str(frame.get("status") or "").lower(),
             event_key=event_key or str(frame.get("event") or ""),
+            block_id=block_id,
             extra={k: v for k, v in frame.items()
-                   if k not in {"type", "objectLabel", "label",
-                                "objectId", "id", "status"}},
+                   if k not in {"type", "objectLabel", "label", "seatLabel",
+                                "objectId", "id", "status", "blockId",
+                                "block_id", "sectionId", "parentArea",
+                                "areaId"}},
             raw=frame,
         )
 
@@ -123,16 +144,7 @@ class SeatStatusEvent:
 # Sniper
 # ════════════════════════════════════════════════════════════════════════
 class SeatIOSniper:
-    """Real-time seats.io drop-watcher.
-
-    Args:
-      event_key: the seats.io chart event id (resolve via chart_mapper /
-                 SeatsioClient first — it's NOT the webook slug).
-      endpoint:  override the WSS URL (auto-rotates the EU/NA/AM pool by
-                 default).
-      on_drop:   optional async callback invoked for every drop event.
-      reconnect_backoff: (initial, max) seconds between reconnect attempts.
-    """
+    """Real-time seats.io / seatcloud drop-watcher."""
 
     PING_REPLY = '{"type":"PONG"}'
 
@@ -140,18 +152,28 @@ class SeatIOSniper:
         self,
         *,
         event_key: str,
+        chart_key: str = "",
+        workspace_key: str = "",
+        workspace_token: str = "",
         endpoint: Optional[str] = None,
         on_drop: Optional[Callable[[SeatStatusEvent], Awaitable[None]]] = None,
+        target_block_ids: Optional[Iterable[str]] = None,
         reconnect_backoff: tuple[float, float] = (1.0, 30.0),
         connect_timeout: float = 15.0,
+        prefer_seatcloud: bool = False,
     ):
         if not event_key:
             raise ValueError("event_key is required")
         self.event_key = event_key
+        self.chart_key = chart_key or ""
+        self.workspace_key = workspace_key or ""
+        self.workspace_token = workspace_token or ""
         self.endpoint = endpoint
         self._on_drop = on_drop
+        self._targets: set[str] = {str(b) for b in (target_block_ids or [])}
         self._backoff_initial, self._backoff_max = reconnect_backoff
         self._connect_timeout = connect_timeout
+        self._prefer_seatcloud = prefer_seatcloud
         self._queue: asyncio.Queue[SeatStatusEvent] = asyncio.Queue()
         self._stop = asyncio.Event()
         self._ws: Optional[Any] = None
@@ -159,18 +181,38 @@ class SeatIOSniper:
         self._connected = asyncio.Event()
         self._frames_seen = 0
         self._drops_seen = 0
+        self._matched_drops = 0
+        self._endpoint_used = ""
+
+    # ── public mutators ───────────────────────────────────────────────
+    def set_targets(self, block_ids: Iterable[str]) -> None:
+        """Update the block filter on the fly. Empty set = accept all."""
+        self._targets = {str(b) for b in block_ids if str(b)}
+        log.info("ws_sniper targets updated: %s", sorted(self._targets))
+
+    def matches_target(self, evt: SeatStatusEvent) -> bool:
+        """Whether this drop concerns one of the user's chosen blocks."""
+        if not self._targets:
+            return True
+        return (
+            evt.block_id in self._targets
+            or evt.object_id in self._targets
+            or evt.object_label in self._targets
+            or any(t in evt.object_label for t in self._targets)
+        )
 
     # ── lifecycle ─────────────────────────────────────────────────────
     async def __aenter__(self) -> "SeatIOSniper":
         self._task = asyncio.create_task(self._run(), name="ws_sniper")
-        await asyncio.wait_for(self._connected.wait(), timeout=self._connect_timeout)
+        await asyncio.wait_for(
+            self._connected.wait(), timeout=self._connect_timeout,
+        )
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.stop()
 
     async def start(self) -> None:
-        """Run the sniper as a long-lived task (blocks until stop())."""
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name="ws_sniper")
         await self._task
@@ -191,7 +233,6 @@ class SeatIOSniper:
 
     # ── public iteration / stats ──────────────────────────────────────
     async def events(self) -> AsyncIterator[SeatStatusEvent]:
-        """Async iterator over all incoming SeatStatusEvent frames."""
         while not self._stop.is_set():
             try:
                 evt = await asyncio.wait_for(self._queue.get(), timeout=1.0)
@@ -200,11 +241,14 @@ class SeatIOSniper:
                 continue
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         return {
             "frames_seen": self._frames_seen,
             "drops_seen": self._drops_seen,
+            "matched_drops": self._matched_drops,
             "queue_size": self._queue.qsize(),
+            "endpoint": self._endpoint_used,
+            "targets": sorted(self._targets),
         }
 
     @property
@@ -215,7 +259,29 @@ class SeatIOSniper:
     def _endpoint_pool(self) -> tuple[str, ...]:
         if self.endpoint:
             return (self.endpoint,)
-        return WS_ENDPOINTS
+        if self._prefer_seatcloud:
+            return SEATCLOUD_WS_ENDPOINTS + WS_ENDPOINTS
+        return WS_ENDPOINTS + SEATCLOUD_WS_ENDPOINTS
+
+    def _build_subscribe_frame(self) -> dict[str, Any]:
+        """V15.2 — full subscription envelope.
+
+        Carries chartKey + workspaceKey + token so seats_planner accepts
+        the connection AND we receive seat-level status frames in
+        real-time (legacy events ignore the extras silently).
+        """
+        sub: dict[str, Any] = {
+            "type": "subscribe",
+            "channel": f"events.{self.event_key}",
+            "eventKey": self.event_key,
+        }
+        if self.chart_key:
+            sub["chartKey"] = self.chart_key
+        if self.workspace_key:
+            sub["workspaceKey"] = self.workspace_key
+        if self.workspace_token:
+            sub["token"] = self.workspace_token
+        return sub
 
     async def _run(self) -> None:
         backoff = self._backoff_initial
@@ -230,20 +296,18 @@ class SeatIOSniper:
                     open_timeout=self._connect_timeout,
                     ping_interval=None,  # we manage PING/PONG manually
                     close_timeout=2.0,
-                    max_size=4 * 1024 * 1024,  # 4 MiB safety
+                    max_size=4 * 1024 * 1024,
                 ) as ws:
                     self._ws = ws
-                    log.info("ws_sniper connected → %s", url)
-                    # Subscribe immediately
-                    sub = {
-                        "type": "subscribe",
-                        "channel": f"events.{self.event_key}",
-                    }
-                    await ws.send(json.dumps(sub))
+                    self._endpoint_used = url
+                    log.info("ws_sniper connected → %s (event=%s chart=%s)",
+                             url, self.event_key[:24], self.chart_key[:24])
+                    await ws.send(json.dumps(self._build_subscribe_frame()))
                     self._connected.set()
-                    backoff = self._backoff_initial  # reset on success
+                    backoff = self._backoff_initial
                     await self._read_loop(ws)
-            except (ConnectionClosed, InvalidStatus, OSError, asyncio.TimeoutError) as e:
+            except (ConnectionClosed, InvalidStatus, OSError,
+                    asyncio.TimeoutError) as e:
                 log.warning("ws_sniper conn err on %s: %s", url, e)
             except Exception as e:  # pragma: no cover
                 log.exception("ws_sniper unexpected err: %s", e)
@@ -257,7 +321,6 @@ class SeatIOSniper:
             backoff = min(backoff * 2, self._backoff_max)
 
     async def _read_loop(self, ws) -> None:
-        """Drain the WSS connection until it closes or stop is requested."""
         async for raw in ws:
             if self._stop.is_set():
                 break
@@ -265,8 +328,6 @@ class SeatIOSniper:
                 payload = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
             except Exception:
                 continue
-            # Server batches frames into a top-level list, but single dicts
-            # are also valid. Normalise both.
             frames = payload if isinstance(payload, list) else [payload]
             for frame in frames:
                 if not isinstance(frame, dict):
@@ -284,12 +345,16 @@ class SeatIOSniper:
                     continue
                 if evt.is_drop:
                     self._drops_seen += 1
-                    if self._on_drop is not None:
-                        try:
-                            asyncio.create_task(self._on_drop(evt))
-                        except Exception as e:  # pragma: no cover
-                            log.warning("on_drop callback err: %s", e)
-                # Always enqueue (consumer can filter)
+                    if self.matches_target(evt):
+                        self._matched_drops += 1
+                        log.info("🎯 matched drop: block=%s label=%s",
+                                 evt.block_id, evt.object_label)
+                        if self._on_drop is not None:
+                            try:
+                                asyncio.create_task(self._on_drop(evt))
+                            except Exception as e:
+                                log.warning("on_drop callback err: %s", e)
+                # Always enqueue; consumer can filter.
                 try:
                     self._queue.put_nowait(evt)
                 except asyncio.QueueFull:
@@ -300,27 +365,41 @@ class SeatIOSniper:
 # Self-test
 # ════════════════════════════════════════════════════════════════════════
 async def _selftest(event_key: str = "selftest-channel") -> int:
-    """Establish the WSS connection, subscribe, and confirm a PING is seen.
-
-    Uses a bogus event_key — we just need to verify:
-      1. The WSS handshake succeeds (no 4xx).
-      2. The server accepts our subscribe frame.
-      3. Heartbeat (PING) round-trip works.
-    """
     print(f"  → connecting to seats.io messaging WS (event_key={event_key!r})…")
-    snip = SeatIOSniper(event_key=event_key, connect_timeout=12.0)
+    snip = SeatIOSniper(
+        event_key=event_key,
+        chart_key="3d17635d-e547-434b-b7de-f374036045d4",
+        workspace_key="66e63c10464382fb1f049832",
+        target_block_ids={"130", "131"},
+        connect_timeout=12.0,
+    )
     try:
         async with snip:
             print(f"  ✓ connected: {snip.connected}")
-            # Wait up to 30 s for at least one server frame (PING typically <25 s)
             for _ in range(30):
                 if snip._frames_seen > 0:
                     break
                 await asyncio.sleep(1)
-            print(f"  ✓ frames_seen: {snip._frames_seen}  "
-                  f"drops_seen: {snip._drops_seen}")
-            assert snip.connected, "must be connected"
-            assert snip._frames_seen >= 1, "expected at least a PING within 30 s"
+            print(f"  ✓ {snip.stats}")
+            assert snip.connected
+            assert snip._frames_seen >= 1, "expected a PING within 30 s"
+
+        # Filter test (offline)
+        from dataclasses import replace
+        evt_match = SeatStatusEvent(
+            object_label="130-A-5", object_id="oid1", status="available",
+            event_key=event_key, block_id="130", extra={}, raw={},
+        )
+        evt_miss = SeatStatusEvent(
+            object_label="999-A-5", object_id="oid2", status="available",
+            event_key=event_key, block_id="999", extra={}, raw={},
+        )
+        assert snip.matches_target(evt_match)
+        assert not snip.matches_target(evt_miss)
+        snip.set_targets([])
+        assert snip.matches_target(evt_miss), "empty targets must accept all"
+        print("  ✓ block filter accepts target block_id, rejects others")
+
         print("\n🏆 ws_sniper self-test PASSED.")
         return 0
     except Exception as e:
@@ -330,13 +409,11 @@ async def _selftest(event_key: str = "selftest-channel") -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     import sys
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     )
-
-    print("🧪 Hydra V15 — ws_sniper self-test")
+    print("🧪 Hydra V15.2 — ws_sniper self-test")
     print("=" * 70)
     ek = sys.argv[1] if len(sys.argv) > 1 else "selftest-channel"
     sys.exit(asyncio.run(_selftest(ek)))

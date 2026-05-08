@@ -83,10 +83,26 @@ async def default_fire(
 ) -> WorkerResult:
     """Default POST → /api/v2/event-detail/<slug>/hold-token
 
+    V15.2 — payload now mirrors the EXACT shape Webook's frontend
+    sends when a seat transitions to ``available``:
+
+        {
+          "event_id":   "<webook event _id>",
+          "lang":       "en",
+          "chart_key":  "<seats.io chart_key>",     # NEW
+          "event_key":  "<seats.io event_key>",     # NEW
+          "object_label": "130-A-12",                # NEW (target seat)
+          "category_key": 1,                          # NEW (price tier)
+          "block_id":     "130",                      # NEW (parent area)
+          "turnstile":  "<token>",                  # if needed
+          "time_slot_id": "..."                     # if needed
+        }
+
     Uses the V14.1 curl_cffi-based StealthClient so the TLS fingerprint
     matches a real Chrome and Cloudflare lets the request through.
     """
     from app.services.stealth_client import StealthClient
+    from app.services.login_robust import resolve_public_token
 
     url = (
         "https://api.webook.com/api/v2/event-detail/"
@@ -96,24 +112,31 @@ async def default_fire(
         "event_id": account.event_id,
         "lang": "en",
     }
+    # V15.2: identifying fields the seats_planner backend uses to bind
+    # the hold-token to the exact seat that just dropped.
+    for key in ("chart_key", "event_key", "object_label", "category_key",
+                "block_id", "workspace_key"):
+        v = ctx.get(key)
+        if v not in (None, ""):
+            body[key] = v
     if ctx.get("turnstile"):
         body["turnstile"] = ctx["turnstile"]
     if ctx.get("time_slot_id"):
         body["time_slot_id"] = ctx["time_slot_id"]
-    if ctx.get("object_label"):
-        body["object_label"] = ctx["object_label"]
 
+    pub_tok = resolve_public_token("")
     headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
         "authorization": f"Bearer {account.bearer}",
         "content-type": "application/json",
+        "origin": "https://webook.com",
+        "referer": "https://webook.com/",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+        "token": pub_tok,
+        "x-webook-public-token": pub_tok,
     }
-    try:
-        from app.core.config import webook_public_token
-        tok = webook_public_token()
-        if tok:
-            headers["token"] = tok
-    except Exception:
-        pass
 
     t0 = time.perf_counter()
     try:
@@ -230,6 +253,11 @@ class AsyncZombieWorkerPool:
         self,
         *,
         object_label: str = "",
+        block_id: str = "",
+        category_key: str = "",
+        chart_key: str = "",
+        event_key: str = "",
+        workspace_key: str = "",
         turnstile: str = "",
         time_slot_id: str = "",
         timeout: float = 10.0,
@@ -244,6 +272,11 @@ class AsyncZombieWorkerPool:
         self._fires += 1
         ctx = {
             "object_label": object_label,
+            "block_id": block_id,
+            "category_key": category_key,
+            "chart_key": chart_key,
+            "event_key": event_key,
+            "workspace_key": workspace_key,
             "turnstile": turnstile,
             "time_slot_id": time_slot_id,
             "fire_id": uuid.uuid4().hex[:8],

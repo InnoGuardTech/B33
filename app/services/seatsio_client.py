@@ -68,22 +68,43 @@ def _trace_id() -> str:
     return f"{int(time.time()*1000)}-{int(time.time()*1e6) % 100000:05d}"
 
 
-def _chart_headers(hold_token: str = "", turnstile: str = "") -> dict[str, str]:
+def _chart_headers(
+    hold_token: str = "",
+    turnstile: str = "",
+    bearer: str = "",
+) -> dict[str, str]:
+    """V15.2 — chart-fetch headers used for ALL seats.io / seatcloud /
+    api.webook.com chart-data requests.
+
+    Includes the FULL trust set required by Webook's WAF:
+      • Authorization: Bearer <user JWT>      (when known)
+      • X-Webook-Public-Token: <built-in/env>  (mandatory)
+      • Origin/Referer: webook.com            (cross-site CORS)
+      • Modern Chrome 131 sec-ch-ua hints
+      • Optional Cloudflare Turnstile token + hold-token
+    """
+    pub_tok = resolve_public_token("")
     h = {
-        "accept": "application/json",
-        "accept-encoding": "gzip, deflate",
+        "accept": "application/json, text/plain, */*",
+        "accept-encoding": "gzip, deflate, br",
+        "accept-language": "ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7",
         "user-agent": DEFAULT_UA,
-        "origin": "https://chart.seatcloud.com",
-        "referer": "https://chart.seatcloud.com/",
-        "accept-language": "ar-SA,ar;q=0.9,en;q=0.8",
-        "sec-ch-ua": '"Not:A-Brand";v="99", "Chromium";v="128"',
-        "sec-ch-ua-platform": '"Windows"',
+        "origin": WEBOOK_ORIGIN,
+        "referer": f"{WEBOOK_ORIGIN}/",
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
+        "authorization": f"Bearer {bearer}" if bearer else "Bearer",
+        # Both header spellings — webook reads either depending on route.
+        "token": pub_tok,
+        "x-webook-public-token": pub_tok,
     }
     if hold_token:
         h["x-hold-token"] = hold_token
     if turnstile:
-        # Some webook deployments accept the turnstile token at chart-level too
         h["cf-turnstile-response"] = turnstile
         h["x-turnstile-token"] = turnstile
     return h
@@ -580,16 +601,24 @@ class SeatsioClient:
                  chart_key: str = "",
                  provider: str = "",
                  hold_token: str = "",
-                 turnstile_token: str = ""):
+                 turnstile_token: str = "",
+                 bearer: str = "",
+                 event_slug: str = ""):
         self.event_key = event_key
         self.workspace_key = workspace_key or ""
         self.chart_key = chart_key or ""
         self.provider = (provider or "").lower()
         self.hold_token = hold_token or ""
         self.hold_token_expires = 0.0
+        # V15.2: bearer token used for /event-detail / /chart fetches that
+        # webook routes through its own gateway. When present, it's added
+        # as `Authorization: Bearer ...` to ALL chart-layer requests.
+        self.bearer = bearer or ""
         # v8: chart-layer Turnstile token — some webook deployments require
         # one even when fetching the chart map (not just the hold-token).
         self.turnstile_token = turnstile_token or ""
+        # Webook event slug — needed by the chart_mapper auto-resolver path.
+        self.event_slug = event_slug or ""
         # V15-final: session is now a StealthClient (curl_cffi).
         self.session: Optional[StealthClient] = None
         self._ws_task: Optional[asyncio.Task] = None
@@ -624,20 +653,43 @@ class SeatsioClient:
         if self.session:
             await self.session.close()
 
-    # ── HTTP helpers (V15-final — curl_cffi) ──
+    # ── HTTP helpers (V15.2 — curl_cffi + manual gzip) ──
+    @staticmethod
+    def _decode_body(r) -> Any:
+        """Decode a curl_cffi response body even when gzip-encoded.
+
+        seatcloud.com returns the chart JSON pre-gzipped (Content-Encoding
+        is missing in some responses, so curl_cffi doesn't auto-decompress).
+        We try plain .json() first, then fall back to manual gunzip on
+        the raw bytes.
+        """
+        # 1. Fast path — plain JSON
+        try:
+            return r.json()
+        except Exception:
+            pass
+        # 2. Manual gzip decode
+        try:
+            raw = r.content
+            if isinstance(raw, (bytes, bytearray)) and raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            txt = raw.decode("utf-8", errors="replace") if isinstance(
+                raw, (bytes, bytearray)) else str(raw)
+            if not txt.strip():
+                return None
+            return json.loads(txt)
+        except Exception:
+            try:
+                return {"raw": (r.text or "")[:500]}
+            except Exception:
+                return None
+
     async def _get(self, url: str, *, headers: dict, timeout: int = 15) -> tuple[int, Any]:
         try:
             r = await self.session.request(
                 "GET", url, headers=headers, timeout=float(timeout),
             )
-            try:
-                d = r.json()
-            except Exception:
-                try:
-                    d = {"raw": (r.text or "")[:500]}
-                except Exception:
-                    d = None
-            return r.status_code, d
+            return r.status_code, self._decode_body(r)
         except Exception as e:
             log.debug(f"GET {url[:120]} → {e}")
             return 0, {"error": str(e)[:200]}
@@ -649,19 +701,12 @@ class SeatsioClient:
                 "POST", url, headers=headers, json=body,
                 timeout=float(timeout),
             )
-            try:
-                d = r.json()
-            except Exception:
-                try:
-                    d = {"raw": (r.text or "")[:500]}
-                except Exception:
-                    d = None
-            return r.status_code, d
+            return r.status_code, self._decode_body(r)
         except Exception as e:
             log.debug(f"POST {url[:120]} → {e}")
             return 0, {"error": str(e)[:200]}
 
-    # ── Modern API (seats_planner) ──
+    # ── Modern API (seats_planner) — V15.2: full stealth + bearer ──
     async def fetch_event(self) -> dict:
         if not self.workspace_key:
             return {}
@@ -669,13 +714,16 @@ class SeatsioClient:
                f"{self.event_key}?trace_id={_trace_id()}&plain=true")
         st, d = await self._get(
             url,
-            headers=_chart_headers(self.hold_token, self.turnstile_token),
+            headers=_chart_headers(
+                self.hold_token, self.turnstile_token, getattr(self, "bearer", ""),
+            ),
         )
         if st == 200 and isinstance(d, dict):
             self._cached_event = d
             return d
         if st in (401, 403):
-            log.debug(f"fetch_event blocked status={st} for {self.event_key[:8]}")
+            log.warning("fetch_event blocked status=%s for %s",
+                        st, self.event_key[:16])
         return {}
 
     async def fetch_map(self) -> dict:
@@ -685,14 +733,17 @@ class SeatsioClient:
                f"{self.chart_key}/data?trace_id={_trace_id()}&plain=true")
         st, d = await self._get(
             url,
-            headers=_chart_headers(self.hold_token, self.turnstile_token),
+            headers=_chart_headers(
+                self.hold_token, self.turnstile_token, getattr(self, "bearer", ""),
+            ),
             timeout=20,
         )
         if st == 200 and isinstance(d, dict):
             self._cached_map = d
             return d
         if st in (401, 403):
-            log.debug(f"fetch_map blocked status={st} for {self.chart_key[:8]}")
+            log.warning("fetch_map blocked status=%s for %s",
+                        st, self.chart_key[:16])
         return {}
 
     async def fetch_item_statuses(self) -> dict[str, str]:
@@ -704,7 +755,9 @@ class SeatsioClient:
             url += f"&hold_token={self.hold_token}"
         st, d = await self._get(
             url,
-            headers=_chart_headers(self.hold_token, self.turnstile_token),
+            headers=_chart_headers(
+                self.hold_token, self.turnstile_token, getattr(self, "bearer", ""),
+            ),
         )
         # 204 = empty, no items held → all free
         if st in (200, 204):
